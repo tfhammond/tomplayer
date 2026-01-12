@@ -1,0 +1,15 @@
+# CMake / build output
+/build*/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.cmake.user
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+
+#other crap
+AGENTS.md
