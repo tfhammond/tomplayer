@@ -12,6 +12,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(PLAYER_SOURCES
   src/main.cpp
   src/cli/interactive_cli.cpp
+  src/demo/wasapi_demo.cpp
   src/engine/player_engine.cpp
   src/audio/wasapi_output.cpp
   src/decode/wav_decoder.cpp
@@ -23,7 +24,7 @@ target_include_directories(player PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_features(player PRIVATE cxx_std_20)
 
 find_package(FLAC CONFIG REQUIRED)
-target_link_libraries(player PRIVATE FLAC::FLAC)
+target_link_libraries(player PRIVATE FLAC::FLAC ole32 mmdevapi avrt uuid)
 
 if (MSVC)
   target_compile_options(player PRIVATE /W4 /permissive- /EHsc /Zc:__cplusplus)
