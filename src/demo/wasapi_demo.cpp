@@ -84,11 +84,11 @@ bool ParseArgs(int argc, char* argv[], DemoOptions* options) {
   return true;
 }
 
-const char* SampleFormatToString(audio::SampleFormat format) {
+const char* SampleFormatToString(tomplayer::wasapi::SampleFormat format) {
   switch (format) {
-    case audio::SampleFormat::Float32:
+    case tomplayer::wasapi::SampleFormat::Float32:
       return "float32";
-    case audio::SampleFormat::Pcm16:
+    case tomplayer::wasapi::SampleFormat::Pcm16:
       return "pcm16";
     default:
       return "unsupported";
@@ -144,7 +144,7 @@ int RunWasapiDemo(int argc, char* argv[]) {
     return 1;
   }
 
-  audio::WasapiOutput output;
+  tomplayer::wasapi::WasapiOutput output;
   SineState sine;
   if (!output.init_default_device(&RenderSine, &sine)) {
     std::cerr << "Failed to initialize WASAPI output.\n";
@@ -158,7 +158,7 @@ int RunWasapiDemo(int argc, char* argv[]) {
   std::cout << "Mix format: " << output.sample_rate() << " Hz, " << output.channels()
             << " ch, " << SampleFormatToString(output.sample_format()) << "\n";
 
-  if (output.sample_format() == audio::SampleFormat::Unsupported) {
+  if (output.sample_format() == tomplayer::wasapi::SampleFormat::Unsupported) {
     std::cout << "Mix format unsupported; rendering silence.\n";
   }
 

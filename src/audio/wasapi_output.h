@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <thread>
@@ -17,7 +18,10 @@
 #include <windows.h>
 #include <wrl/client.h>
 
-namespace audio {
+namespace tomplayer {
+namespace wasapi {
+
+using RenderCallback = bool (*)(float* out, uint32_t frames, uint32_t channels, void* user);
 
 enum class SampleFormat {
   Float32,
@@ -25,10 +29,38 @@ enum class SampleFormat {
   Unsupported
 };
 
+namespace detail {
+// Test seam for render-path unit tests; production wires COM calls into these slots.
+struct RenderApi {
+  void* context{nullptr};
+  HRESULT (*GetCurrentPadding)(void* context, UINT32* padding) = nullptr;
+  HRESULT (*GetBuffer)(void* context, UINT32 frames, BYTE** data) = nullptr;
+  HRESULT (*ReleaseBuffer)(void* context, UINT32 frames, DWORD flags) = nullptr;
+};
+
+// Test seam for start/stop without creating real COM interfaces.
+struct StartStopApi {
+  void* context{nullptr};
+  HRESULT (*Start)(void* context) = nullptr;
+  HRESULT (*Stop)(void* context) = nullptr;
+  HRESULT (*Reset)(void* context) = nullptr;
+};
+
+SampleFormat DetectSampleFormat(const WAVEFORMATEX* format);
+void ConvertFloatToPcm16(const float* in, int16_t* out, std::size_t samples);
+void RenderAudioCore(const RenderApi& api,
+                     RenderCallback callback,
+                     void* callback_user,
+                     uint32_t buffer_frames,
+                     uint32_t channels,
+                     SampleFormat format,
+                     float* float_scratch);
+}  // namespace detail
+
 class WasapiOutput {
 public:
-  // Invoked on the real-time render thread; must not allocate, block, or throw.
-  using RenderCallback = bool (*)(float* out, uint32_t frames, uint32_t channels, void* user);
+  // Runs on the real-time render thread; keep it allocation-free and non-blocking.
+  using RenderCallback = ::tomplayer::wasapi::RenderCallback;
 
   WasapiOutput();
   ~WasapiOutput();
@@ -36,7 +68,7 @@ public:
   WasapiOutput(const WasapiOutput&) = delete;
   WasapiOutput& operator=(const WasapiOutput&) = delete;
 
-  // Call CoInitializeEx(COINIT_MULTITHREADED) before init_default_device and keep COM initialized.
+  // COM must stay initialized on the caller thread while COM interfaces are in use.
   bool init_default_device(RenderCallback callback, void* user);
   bool start();
   void stop();
@@ -48,7 +80,15 @@ public:
   uint16_t bits_per_sample() const { return bits_per_sample_; }
   uint32_t buffer_frames() const { return buffer_frames_; }
 
+#if defined(TOMPLAYER_TESTING)
+  void set_start_stop_api_for_test(const detail::StartStopApi& api,
+                                   HANDLE audio_event,
+                                   HANDLE stop_event);
+  bool is_running_for_test() const { return running_.load(std::memory_order_relaxed); }
+#endif
+
 private:
+  // Only the render thread may touch the render client.
   void RenderLoop();
   void RenderAudio();
 
@@ -58,6 +98,11 @@ private:
   Microsoft::WRL::ComPtr<IMMDevice> device_;
   Microsoft::WRL::ComPtr<IAudioClient> audio_client_;
   Microsoft::WRL::ComPtr<IAudioRenderClient> render_client_;
+
+  struct RenderApiContext {
+    IAudioClient* audio_client{nullptr};
+    IAudioRenderClient* render_client{nullptr};
+  };
 
   WAVEFORMATEX* mix_format_{nullptr};
 
@@ -74,7 +119,13 @@ private:
   uint16_t block_align_{0};
   SampleFormat sample_format_{SampleFormat::Unsupported};
 
+  detail::RenderApi render_api_{};
+  detail::StartStopApi start_stop_api_{};
+  RenderApiContext render_api_context_{};
+
+  // Scratch space keeps PCM16 conversion off the heap during render.
   std::unique_ptr<float[]> float_scratch_;
 };
 
-}  // namespace audio
+}  // namespace wasapi
+}  // namespace tomplayer
