@@ -26,6 +26,22 @@ target_compile_features(player PRIVATE cxx_std_20)
 find_package(FLAC CONFIG REQUIRED)
 target_link_libraries(player PRIVATE FLAC::FLAC ole32 mmdevapi avrt uuid)
 
+include(CTest)
+if (BUILD_TESTING)
+  find_package(Catch2 CONFIG REQUIRED)
+
+  add_executable(wasapi_output_tests
+    tests/wasapi_output_tests.cpp
+    src/audio/wasapi_output.cpp
+  )
+  target_include_directories(wasapi_output_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_features(wasapi_output_tests PRIVATE cxx_std_20)
+  target_compile_definitions(wasapi_output_tests PRIVATE TOMPLAYER_TESTING)
+  target_link_libraries(wasapi_output_tests PRIVATE Catch2::Catch2WithMain ole32 avrt)
+
+  add_test(NAME wasapi_output_tests COMMAND wasapi_output_tests)
+endif()
+
 if (MSVC)
   target_compile_options(player PRIVATE /W4 /permissive- /EHsc /Zc:__cplusplus)
 else()

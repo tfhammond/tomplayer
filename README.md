@@ -44,8 +44,24 @@ cmake --build build --config Release
 ## Run
 
 ```powershell
-build\Debug\player.exe <path-to-audio-file>
+build\Debug\player.exe --repeat 3 --seconds 2 --frequency 440
 ```
+
+The current demo plays a sine tone and cycles start/stop for validation.
+
+Use `--stress` to run a CPU load during playback.
+
+## WASAPI notes
+
+- The demo uses event-driven shared-mode WASAPI with a dedicated render thread.
+- `tomplayer::wasapi::WasapiOutput` expects `CoInitializeEx(COINIT_MULTITHREADED)` on the calling thread.
+- Linker inputs (already wired in CMake): `ole32`, `mmdevapi`, `audioclient`, `avrt`.
+
+## Tests (WASAPI module)
+
+- Unit tests use `tomplayer::wasapi::detail::RenderApi` and helpers to avoid real audio devices.
+- Render-path logic is exercised with fakes; no Windows audio service access required.
+- Run: `ctest --test-dir build\vs2022-debug -C Debug` (or `build\vs2022-release`).
 
 ## Scope (v1)
 
