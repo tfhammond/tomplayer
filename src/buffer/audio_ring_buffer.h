@@ -47,13 +47,13 @@ public:
   // Errors: none.
   void reset();
 
-  // Summary: Number of underrun events observed by the consumer.
+  // Summary: Number of read requests not fully satisfied (partials and zeros).
   // Preconditions: none.
   // Postconditions: does not modify state.
   // Errors: none.
   uint64_t underrun_count() const;
 
-  // Summary: Number of overrun events observed by the producer.
+  // Summary: Number of write requests not fully satisfied (partials and zeros).
   // Preconditions: none.
   // Postconditions: does not modify state.
   // Errors: none.
