@@ -21,6 +21,9 @@ uint32_t AudioRingBuffer::available_to_write_frames() const {
 
 uint32_t AudioRingBuffer::write_frames(const float* src_interleaved,
                                        uint32_t frames_requested) {
+  if (frames_requested > 0) {
+    assert(src_interleaved != nullptr);
+  }
   if (!storage_.size() || capacity_frames_ == 0 || channels_ == 0) {
     return 0;
   }
@@ -81,6 +84,9 @@ uint32_t AudioRingBuffer::available_to_read_frames() const {
 
 uint32_t AudioRingBuffer::read_frames(float* dst_interleaved,
                                       uint32_t frames_requested) {
+  if (frames_requested > 0) {
+    assert(dst_interleaved != nullptr);
+  }
   if (!storage_.size() || capacity_frames_ == 0 || channels_ == 0) {
     return 0;
   }
@@ -131,10 +137,16 @@ uint32_t AudioRingBuffer::read_frames(float* dst_interleaved,
 }
 
 void AudioRingBuffer::reset() {
+  // Safe only when no producer/consumer threads are active on the buffer.
+#ifndef NDEBUG
+  assert(available_to_read_frames() == 0);
+  assert(available_to_write_frames() == capacity_frames_);
+#endif
   write_pos_frames_.store(0, std::memory_order_relaxed);
   read_pos_frames_.store(0, std::memory_order_relaxed);
   underrun_count_.store(0, std::memory_order_relaxed);
   overrun_count_.store(0, std::memory_order_relaxed);
+  invariant_violation_count_.store(0, std::memory_order_relaxed);
 }
 
 uint64_t AudioRingBuffer::underrun_count() const {
@@ -151,18 +163,24 @@ uint64_t AudioRingBuffer::invariant_violation_count() const {
 
 uint32_t AudioRingBuffer::available_to_read_frames_impl(uint64_t write_pos_frames,
                                                         uint64_t read_pos_frames) const {
+#ifndef NDEBUG
   assert(write_pos_frames >= read_pos_frames);
   assert(write_pos_frames - read_pos_frames <= capacity_frames_);
-
+#else
   if (write_pos_frames < read_pos_frames) {
     invariant_violation_count_.fetch_add(1, std::memory_order_relaxed);
     return 0;
   }
+#endif
 
   const uint64_t available = write_pos_frames - read_pos_frames;
+#ifndef NDEBUG
+  return static_cast<uint32_t>(available);
+#else
   if (available > capacity_frames_) {
     invariant_violation_count_.fetch_add(1, std::memory_order_relaxed);
     return capacity_frames_;
   }
   return static_cast<uint32_t>(available);
+#endif
 }

@@ -43,7 +43,7 @@ public:
   uint32_t read_frames(float* dst_interleaved, uint32_t frames_requested);
 
   // Summary: Reset read/write positions and counters.
-  // Preconditions: only call when both producer and consumer threads are stopped.
+  // Preconditions: only call when no producer/consumer threads are in read/write.
   // Postconditions: positions and counters are cleared.
   // Errors: none.
   void reset();
@@ -78,5 +78,6 @@ private:
   std::atomic<uint64_t> read_pos_frames_{0};
   std::atomic<uint64_t> underrun_count_{0};
   std::atomic<uint64_t> overrun_count_{0};
+  // Mutable so const diagnostic reads can record invariant violations in release.
   mutable std::atomic<uint64_t> invariant_violation_count_{0};
 };
