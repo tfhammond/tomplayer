@@ -5,10 +5,11 @@
 #include <vector>
 
 // AudioRingBuffer
-// - Single-producer/single-consumer only.
+// - Single-producer/single-consumer only; multiple producers/consumers are misuse.
 // - Frame-based semantics (frame = one sample per channel at a single time step).
 // - Interleaved PCM float32 storage (e.g., stereo is LRLR...).
 // - Real-time constraints: no allocations, locks, or blocking in read/write.
+// - Invariant: write_pos_frames >= read_pos_frames and (write_pos_frames - read_pos_frames) <= capacity.
 class AudioRingBuffer {
 public:
   // Summary: Construct a fixed-capacity ring buffer sized in frames.
@@ -59,6 +60,12 @@ public:
   // Errors: none.
   uint64_t overrun_count() const;
 
+  // Summary: Count of invariant violations (debug asserts; release fail-soft clamp).
+  // Preconditions: none.
+  // Postconditions: does not modify state.
+  // Errors: non-zero indicates misuse or concurrent reset.
+  uint64_t invariant_violation_count() const;
+
 private:
   uint32_t available_to_read_frames_impl(uint64_t write_pos_frames,
                                          uint64_t read_pos_frames) const;
@@ -71,4 +78,5 @@ private:
   std::atomic<uint64_t> read_pos_frames_{0};
   std::atomic<uint64_t> underrun_count_{0};
   std::atomic<uint64_t> overrun_count_{0};
+  mutable std::atomic<uint64_t> invariant_violation_count_{0};
 };

@@ -1,6 +1,7 @@
 #include "buffer/audio_ring_buffer.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 
 AudioRingBuffer::AudioRingBuffer(uint32_t capacity_frames, uint32_t channels)
@@ -144,10 +145,23 @@ uint64_t AudioRingBuffer::overrun_count() const {
   return overrun_count_.load(std::memory_order_relaxed);
 }
 
+uint64_t AudioRingBuffer::invariant_violation_count() const {
+  return invariant_violation_count_.load(std::memory_order_relaxed);
+}
+
 uint32_t AudioRingBuffer::available_to_read_frames_impl(uint64_t write_pos_frames,
                                                         uint64_t read_pos_frames) const {
+  assert(write_pos_frames >= read_pos_frames);
+  assert(write_pos_frames - read_pos_frames <= capacity_frames_);
+
+  if (write_pos_frames < read_pos_frames) {
+    invariant_violation_count_.fetch_add(1, std::memory_order_relaxed);
+    return 0;
+  }
+
   const uint64_t available = write_pos_frames - read_pos_frames;
   if (available > capacity_frames_) {
+    invariant_violation_count_.fetch_add(1, std::memory_order_relaxed);
     return capacity_frames_;
   }
   return static_cast<uint32_t>(available);
