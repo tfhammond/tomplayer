@@ -44,7 +44,7 @@ cmake --build build --config Release
 ## Run
 
 ```powershell
-build\Debug\player.exe --repeat 3 --seconds 2 --frequency 440
+build\vs2022-debug\Debug\player.exe --repeat 3 --seconds 2 --frequency 440
 ```
 
 The current demo plays a sine tone and cycles start/stop for validation.
