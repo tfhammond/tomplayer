@@ -23,8 +23,6 @@ class AudioRingBuffer;
 namespace tomplayer {
 namespace wasapi {
 
-using RenderCallback = bool (*)(float* out, uint32_t frames, uint32_t channels, void* user);
-
 enum class SampleFormat {
   Float32,
   Pcm16,
@@ -57,20 +55,10 @@ uint32_t ConsumeRingBufferFloat(AudioRingBuffer* ring_buffer,
                                 uint32_t channels,
                                 std::atomic<uint64_t>* underrun_wakes,
                                 std::atomic<uint64_t>* underrun_frames);
-void RenderAudioCore(const RenderApi& api,
-                     RenderCallback callback,
-                     void* callback_user,
-                     uint32_t buffer_frames,
-                     uint32_t channels,
-                     SampleFormat format,
-                     float* float_scratch);
 }  // namespace detail
 
 class WasapiOutput {
 public:
-  // Runs on the real-time render thread; keep it allocation-free and non-blocking.
-  using RenderCallback = ::tomplayer::wasapi::RenderCallback;
-
   WasapiOutput();
   ~WasapiOutput();
 
@@ -78,7 +66,7 @@ public:
   WasapiOutput& operator=(const WasapiOutput&) = delete;
 
   // COM must stay initialized on the caller thread while COM interfaces are in use.
-  bool init_default_device(RenderCallback callback, void* user);
+  bool init_default_device();
 
   // Set the ring buffer used by the render thread.
   // Preconditions: must be called before start(); buffer outlives stop()/shutdown().
@@ -110,6 +98,7 @@ public:
   void set_start_stop_api_for_test(const detail::StartStopApi& api,
                                    HANDLE audio_event,
                                    HANDLE stop_event);
+  void set_channels_for_test(uint16_t channels);
   bool is_running_for_test() const { return running_.load(std::memory_order_relaxed); }
 #endif
 
@@ -117,9 +106,6 @@ private:
   // Only the render thread may touch the render client.
   void RenderLoop();
   void RenderAudio();
-
-  RenderCallback callback_{nullptr};
-  void* callback_user_{nullptr};
 
   Microsoft::WRL::ComPtr<IMMDevice> device_;
   Microsoft::WRL::ComPtr<IAudioClient> audio_client_;

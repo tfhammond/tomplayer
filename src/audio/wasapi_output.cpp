@@ -86,58 +86,6 @@ uint32_t ConsumeRingBufferFloat(AudioRingBuffer* ring_buffer,
   return frames_read;
 }
 
-void RenderAudioCore(const RenderApi& api,
-                     RenderCallback callback,
-                     void* callback_user,
-                     uint32_t buffer_frames,
-                     uint32_t channels,
-                     SampleFormat format,
-                     float* float_scratch) {
-  if (!api.GetCurrentPadding || !api.GetBuffer || !api.ReleaseBuffer) {
-    return;
-  }
-
-  UINT32 padding = 0;
-  if (FAILED(api.GetCurrentPadding(api.context, &padding))) {
-    return;
-  }
-
-  if (padding >= buffer_frames) {
-    return;
-  }
-
-  const UINT32 frames_available = buffer_frames - padding;
-  if (frames_available == 0) {
-    return;
-  }
-
-  BYTE* data = nullptr;
-  if (FAILED(api.GetBuffer(api.context, frames_available, &data)) || !data) {
-    return;
-  }
-
-  bool wrote_audio = false;
-  if (format == SampleFormat::Float32) {
-    float* out = reinterpret_cast<float*>(data);
-    if (callback) {
-      wrote_audio = callback(out, frames_available, channels, callback_user);
-    }
-  } else if (format == SampleFormat::Pcm16 && float_scratch) {
-    bool ok = false;
-    if (callback) {
-      ok = callback(float_scratch, frames_available, channels, callback_user);
-    }
-    if (ok) {
-      const std::size_t samples =
-          static_cast<std::size_t>(frames_available) * channels;
-      ConvertFloatToPcm16(float_scratch, reinterpret_cast<int16_t*>(data), samples);
-      wrote_audio = true;
-    }
-  }
-
-  const DWORD flags = wrote_audio ? 0 : AUDCLNT_BUFFERFLAGS_SILENT;
-  api.ReleaseBuffer(api.context, frames_available, flags);
-}
 }  // namespace detail
 
 WasapiOutput::WasapiOutput() = default;
@@ -146,19 +94,22 @@ WasapiOutput::~WasapiOutput() {
   shutdown();
 }
 
+
+// NOTE: ring_buffer_ is a non-owning pointer and is intentionally *not* synchronized.
+// Contract: set_ring_buffer() must be called exactly once before start(), and never
+// while the render thread is running. The AudioRingBuffer must outlive WasapiOutput.
+// This is safe because std::thread start publishes prior writes; violating this
+// contract would introduce a data race in Release builds.
 void WasapiOutput::set_ring_buffer(AudioRingBuffer* ring_buffer) {
   assert(!running_.load(std::memory_order_relaxed));
   ring_buffer_ = ring_buffer;
 }
 
-bool WasapiOutput::init_default_device(RenderCallback callback, void* user) {
+bool WasapiOutput::init_default_device() {
   // Do setup here so the render path stays allocation-free and deterministic.
   if (audio_client_) {
-    return false;
+    return false; 
   }
-
-  callback_ = callback;
-  callback_user_ = user;
 
   Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
   HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
@@ -189,11 +140,17 @@ bool WasapiOutput::init_default_device(RenderCallback callback, void* user) {
     return false;
   }
 
+
+  sample_format_ = detail::DetectSampleFormat(mix_format_);
+  if (sample_format_ == SampleFormat::Unsupported) {
+    shutdown();
+    return false;
+  }
   sample_rate_ = mix_format_->nSamplesPerSec;
   channels_ = mix_format_->nChannels;
   bits_per_sample_ = mix_format_->wBitsPerSample;
   block_align_ = mix_format_->nBlockAlign;
-  sample_format_ = detail::DetectSampleFormat(mix_format_);
+  
 
   hr = audio_client_->Initialize(AUDCLNT_SHAREMODE_SHARED,
                                  AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -266,7 +223,7 @@ bool WasapiOutput::init_default_device(RenderCallback callback, void* user) {
 }
 
 bool WasapiOutput::start() {
-  // Render client access stays on the render thread to avoid cross-thread COM calls.
+  // Render thread performs GetCurrentPadding/GetBuffer/ReleaseBuffer; Start/Stop/Reset are invoked on the caller thread.
   if (!start_stop_api_.Start || !audio_event_ || !stop_event_) {
     return false;
   }
@@ -340,8 +297,6 @@ void WasapiOutput::shutdown() {
   audio_client_.Reset();
   device_.Reset();
 
-  callback_ = nullptr;
-  callback_user_ = nullptr;
   float_scratch_.reset();
   render_api_ = {};
   start_stop_api_ = {};
@@ -358,7 +313,10 @@ void WasapiOutput::shutdown() {
 void WasapiOutput::RenderLoop() {
   // Event-driven wait avoids busy spinning and keeps RT behavior predictable.
   const HRESULT com_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-  const bool com_ok = SUCCEEDED(com_hr);
+  // RPC_E_CHANGED_MODE means COM is already initialized with a different model.
+  // We uninitialize only when CoInitializeEx succeeds
+  // S_OK/S_FALSE both require CoUninitialize to balance CoInitializeEx.
+  const bool com_should_uninit = SUCCEEDED(com_hr);
 
   DWORD task_index = 0;
   // MMCSS keeps the render loop prioritized without spinning.
@@ -385,23 +343,12 @@ void WasapiOutput::RenderLoop() {
     AvRevertMmThreadCharacteristics(mmcss_handle);
   }
 
-  if (com_ok) {
+  if (com_should_uninit) {
     CoUninitialize();
   }
 }
 
 void WasapiOutput::RenderAudio() {
-  if (sample_format_ != SampleFormat::Float32) {
-    detail::RenderAudioCore(render_api_,
-                            callback_,
-                            callback_user_,
-                            buffer_frames_,
-                            channels_,
-                            sample_format_,
-                            float_scratch_.get());
-    return;
-  }
-
   if (!render_api_.GetCurrentPadding || !render_api_.GetBuffer || !render_api_.ReleaseBuffer) {
     return;
   }
@@ -425,16 +372,38 @@ void WasapiOutput::RenderAudio() {
     return;
   }
 
-  float* out = reinterpret_cast<float*>(data);
-  const uint32_t frames_read = detail::ConsumeRingBufferFloat(ring_buffer_,
-                                                              out,
-                                                              frames_available,
-                                                              channels_,
-                                                              &underrun_wake_count_,
-                                                              &underrun_frame_count_);
+  if (sample_format_ == SampleFormat::Float32) {
+    float* out = reinterpret_cast<float*>(data);
+    const uint32_t frames_read = detail::ConsumeRingBufferFloat(ring_buffer_,
+                                                                out,
+                                                                frames_available,
+                                                                channels_,
+                                                                &underrun_wake_count_,
+                                                                &underrun_frame_count_);
 
-  const DWORD flags = frames_read == 0 ? AUDCLNT_BUFFERFLAGS_SILENT : 0;
-  render_api_.ReleaseBuffer(render_api_.context, frames_available, flags);
+    const DWORD flags = frames_read == 0 ? AUDCLNT_BUFFERFLAGS_SILENT : 0;
+    render_api_.ReleaseBuffer(render_api_.context, frames_available, flags);
+    return;
+  }
+
+  if (sample_format_ == SampleFormat::Pcm16 && float_scratch_) {
+    const uint32_t frames_read = detail::ConsumeRingBufferFloat(ring_buffer_,
+                                                                float_scratch_.get(),
+                                                                frames_available,
+                                                                channels_,
+                                                                &underrun_wake_count_,
+                                                                &underrun_frame_count_);
+    const std::size_t samples =
+        static_cast<std::size_t>(frames_available) * channels_;
+    detail::ConvertFloatToPcm16(float_scratch_.get(),
+                                reinterpret_cast<int16_t*>(data),
+                                samples);
+    const DWORD flags = frames_read == 0 ? AUDCLNT_BUFFERFLAGS_SILENT : 0;
+    render_api_.ReleaseBuffer(render_api_.context, frames_available, flags);
+    return;
+  }
+
+  render_api_.ReleaseBuffer(render_api_.context, frames_available, AUDCLNT_BUFFERFLAGS_SILENT);
 }
 
 #if defined(TOMPLAYER_TESTING)
@@ -444,6 +413,10 @@ void WasapiOutput::set_start_stop_api_for_test(const detail::StartStopApi& api,
   start_stop_api_ = api;
   audio_event_ = audio_event;
   stop_event_ = stop_event;
+}
+
+void WasapiOutput::set_channels_for_test(uint16_t channels) {
+  channels_ = channels;
 }
 #endif
 
