@@ -50,6 +50,13 @@ struct StartStopApi {
 
 SampleFormat DetectSampleFormat(const WAVEFORMATEX* format);
 void ConvertFloatToPcm16(const float* in, int16_t* out, std::size_t samples);
+// Read frames into dst and zero-fill any underrun tail; updates counters if provided.
+uint32_t ConsumeRingBufferFloat(AudioRingBuffer* ring_buffer,
+                                float* dst_interleaved,
+                                uint32_t frames_requested,
+                                uint32_t channels,
+                                std::atomic<uint64_t>* underrun_wakes,
+                                std::atomic<uint64_t>* underrun_frames);
 void RenderAudioCore(const RenderApi& api,
                      RenderCallback callback,
                      void* callback_user,
@@ -87,6 +94,17 @@ public:
   SampleFormat sample_format() const { return sample_format_; }
   uint16_t bits_per_sample() const { return bits_per_sample_; }
   uint32_t buffer_frames() const { return buffer_frames_; }
+  // Summary: Number of render wakes that saw a short read.
+  // Preconditions: none.
+  // Postconditions: does not modify state.
+  // Errors: none.
+  uint64_t underrun_wake_count() const { return underrun_wake_count_.load(std::memory_order_relaxed); }
+
+  // Summary: Number of frames zero-filled due to underrun.
+  // Preconditions: none.
+  // Postconditions: does not modify state.
+  // Errors: none.
+  uint64_t underrun_frame_count() const { return underrun_frame_count_.load(std::memory_order_relaxed); }
 
 #if defined(TOMPLAYER_TESTING)
   void set_start_stop_api_for_test(const detail::StartStopApi& api,
@@ -132,6 +150,8 @@ private:
   RenderApiContext render_api_context_{};
 
   AudioRingBuffer* ring_buffer_{nullptr};
+  std::atomic<uint64_t> underrun_wake_count_{0};
+  std::atomic<uint64_t> underrun_frame_count_{0};
 
   // Scratch space keeps PCM16 conversion off the heap during render.
   std::unique_ptr<float[]> float_scratch_;

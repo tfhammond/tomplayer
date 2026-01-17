@@ -6,6 +6,7 @@
 #include <ksmedia.h>
 
 #include <cassert>
+#include <cstring>
 
 namespace tomplayer {
 namespace wasapi {
@@ -48,6 +49,41 @@ void ConvertFloatToPcm16(const float* in, int16_t* out, std::size_t samples) {
     }
     out[i] = static_cast<int16_t>(sample * 32767.0f);
   }
+}
+
+uint32_t ConsumeRingBufferFloat(AudioRingBuffer* ring_buffer,
+                                float* dst_interleaved,
+                                uint32_t frames_requested,
+                                uint32_t channels,
+                                std::atomic<uint64_t>* underrun_wakes,
+                                std::atomic<uint64_t>* underrun_frames) {
+  if (frames_requested == 0 || channels == 0) {
+    return 0;
+  }
+  assert(dst_interleaved != nullptr);
+
+  uint32_t frames_read = 0;
+  if (ring_buffer) {
+    frames_read = ring_buffer->read_frames(dst_interleaved, frames_requested);
+  }
+
+  if (frames_read < frames_requested) {
+    const size_t sample_offset =
+        static_cast<size_t>(frames_read) * channels;
+    const size_t samples_to_zero =
+        static_cast<size_t>(frames_requested - frames_read) * channels;
+    std::memset(dst_interleaved + sample_offset, 0, samples_to_zero * sizeof(float));
+
+    if (underrun_wakes) {
+      underrun_wakes->fetch_add(1, std::memory_order_relaxed);
+    }
+    if (underrun_frames) {
+      underrun_frames->fetch_add(frames_requested - frames_read,
+                                 std::memory_order_relaxed);
+    }
+  }
+
+  return frames_read;
 }
 
 void RenderAudioCore(const RenderApi& api,
@@ -355,14 +391,50 @@ void WasapiOutput::RenderLoop() {
 }
 
 void WasapiOutput::RenderAudio() {
-  // Shared-mode contract: only fill available frames and always release the buffer.
-  detail::RenderAudioCore(render_api_,
-                          callback_,
-                          callback_user_,
-                          buffer_frames_,
-                          channels_,
-                          sample_format_,
-                          float_scratch_.get());
+  if (sample_format_ != SampleFormat::Float32) {
+    detail::RenderAudioCore(render_api_,
+                            callback_,
+                            callback_user_,
+                            buffer_frames_,
+                            channels_,
+                            sample_format_,
+                            float_scratch_.get());
+    return;
+  }
+
+  if (!render_api_.GetCurrentPadding || !render_api_.GetBuffer || !render_api_.ReleaseBuffer) {
+    return;
+  }
+
+  UINT32 padding = 0;
+  if (FAILED(render_api_.GetCurrentPadding(render_api_.context, &padding))) {
+    return;
+  }
+
+  if (padding >= buffer_frames_) {
+    return;
+  }
+
+  const UINT32 frames_available = buffer_frames_ - padding;
+  if (frames_available == 0) {
+    return;
+  }
+
+  BYTE* data = nullptr;
+  if (FAILED(render_api_.GetBuffer(render_api_.context, frames_available, &data)) || !data) {
+    return;
+  }
+
+  float* out = reinterpret_cast<float*>(data);
+  const uint32_t frames_read = detail::ConsumeRingBufferFloat(ring_buffer_,
+                                                              out,
+                                                              frames_available,
+                                                              channels_,
+                                                              &underrun_wake_count_,
+                                                              &underrun_frame_count_);
+
+  const DWORD flags = frames_read == 0 ? AUDCLNT_BUFFERFLAGS_SILENT : 0;
+  render_api_.ReleaseBuffer(render_api_.context, frames_available, flags);
 }
 
 #if defined(TOMPLAYER_TESTING)
