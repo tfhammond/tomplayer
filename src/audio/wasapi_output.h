@@ -57,9 +57,18 @@ uint32_t ConsumeRingBufferFloat(AudioRingBuffer* ring_buffer,
                                 std::atomic<uint64_t>* underrun_frames);
 }  // namespace detail
 
+// Summary: WASAPI shared-mode output wrapper with event-driven render thread.
+// Preconditions: COM initialized on calling thread before init_default_device.
+// Postconditions: start/stop control render thread lifecycle deterministically.
+// Errors: methods return false on initialization or start failures.
 class WasapiOutput {
 public:
   WasapiOutput();
+
+  // Summary: Shutdown and release resources.
+  // Preconditions: none.
+  // Postconditions: stop() has been called and resources released.
+  // Errors: none.
   ~WasapiOutput();
 
   WasapiOutput(const WasapiOutput&) = delete;
@@ -74,13 +83,47 @@ public:
 
   // Start requires init_default_device, a non-null ring buffer, and matching channels.
   bool start();
+
+  // Summary: Stop rendering and join the render thread.
+  // Preconditions: none (safe if not running).
+  // Postconditions: no render callbacks execute after return.
+  // Errors: none.
   void stop();
+
+  // Summary: Stop and release all COM resources and OS handles.
+  // Preconditions: none.
+  // Postconditions: object returns to uninitialized state.
+  // Errors: none.
   void shutdown();
 
+  // Summary: Device mix sample rate in Hz.
+  // Preconditions: init_default_device succeeded.
+  // Postconditions: none.
+  // Errors: returns 0 if uninitialized.
   uint32_t sample_rate() const { return sample_rate_; }
+
+  // Summary: Device channel count.
+  // Preconditions: init_default_device succeeded.
+  // Postconditions: none.
+  // Errors: returns 0 if uninitialized.
   uint16_t channels() const { return channels_; }
+
+  // Summary: Device sample format.
+  // Preconditions: init_default_device succeeded.
+  // Postconditions: none.
+  // Errors: Unsupported if format is not handled.
   SampleFormat sample_format() const { return sample_format_; }
+
+  // Summary: Bits per sample of the mix format.
+  // Preconditions: init_default_device succeeded.
+  // Postconditions: none.
+  // Errors: returns 0 if uninitialized.
   uint16_t bits_per_sample() const { return bits_per_sample_; }
+
+  // Summary: Size of the WASAPI buffer in frames.
+  // Preconditions: init_default_device succeeded.
+  // Postconditions: none.
+  // Errors: returns 0 if uninitialized.
   uint32_t buffer_frames() const { return buffer_frames_; }
   // Summary: Number of render wakes that saw a short read.
   // Preconditions: none.
@@ -103,8 +146,16 @@ public:
 #endif
 
 private:
-  // Only the render thread may touch the render client.
+  // Summary: Render thread body; waits on the WASAPI event and renders audio.
+  // Preconditions: start() has initialized the event handles.
+  // Postconditions: exits when stop() signals.
+  // Errors: none.
   void RenderLoop();
+
+  // Summary: Single render cycle (padding -> get buffer -> fill -> release).
+  // Preconditions: render thread only; render_api_ is valid.
+  // Postconditions: buffer released or method returns early.
+  // Errors: on failure, returns without rendering (silence handled by caller).
   void RenderAudio();
 
   Microsoft::WRL::ComPtr<IMMDevice> device_;
