@@ -42,6 +42,12 @@ public:
   // Errors: may output fewer frames; returns frames actually read.
   uint32_t read_frames(float* dst_interleaved, uint32_t frames_requested);
 
+  // Summary: Number of channels stored per frame.
+  // Preconditions: none.
+  // Postconditions: does not modify state.
+  // Errors: returns 0 if constructed with invalid channels.
+  uint32_t channels() const { return channels_; }
+
   // Summary: Reset read/write positions and counters.
   // Preconditions: only call when no producer/consumer threads are in read/write.
   // Postconditions: positions and counters are cleared.

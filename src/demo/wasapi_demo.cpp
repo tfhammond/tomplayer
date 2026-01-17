@@ -17,6 +17,7 @@
 #include <objbase.h>
 
 #include "audio/wasapi_output.h"
+#include "buffer/audio_ring_buffer.h"
 
 namespace demo {
 namespace {
@@ -95,8 +96,7 @@ const char* SampleFormatToString(tomplayer::wasapi::SampleFormat format) {
   }
 }
 
-bool RenderSine(float* out, uint32_t frames, uint32_t channels, void* user) {
-  auto* state = static_cast<SineState*>(user);
+void FillSine(float* out, uint32_t frames, uint32_t channels, SineState* state) {
   float phase = state->phase;
   const float increment = state->phase_increment;
 
@@ -113,7 +113,6 @@ bool RenderSine(float* out, uint32_t frames, uint32_t channels, void* user) {
   }
 
   state->phase = phase;
-  return true;
 }
 
 void StressWorker(std::atomic<bool>* running) {
@@ -145,13 +144,19 @@ int RunWasapiDemo(int argc, char* argv[]) {
   }
 
   tomplayer::wasapi::WasapiOutput output;
-  SineState sine;
-  if (!output.init_default_device(&RenderSine, &sine)) {
+  if (!output.init_default_device()) {
     std::cerr << "Failed to initialize WASAPI output.\n";
     CoUninitialize();
     return 1;
   }
 
+  const uint32_t channels = output.channels();
+  const uint32_t capacity_frames =
+      std::max(1u, output.buffer_frames() * 4);
+  AudioRingBuffer ring_buffer(capacity_frames, channels);
+  output.set_ring_buffer(&ring_buffer);
+
+  SineState sine;
   sine.phase_increment =
       kTwoPi * options.frequency / static_cast<float>(output.sample_rate());
 
@@ -174,7 +179,52 @@ int RunWasapiDemo(int argc, char* argv[]) {
     }
   }
 
+  std::atomic<bool> producer_running{true};
+  std::atomic<bool> playback_active{false};
+  std::atomic<bool> producer_idle{true};
+
+  std::thread producer([&]() {
+    const uint32_t chunk_frames = 256;
+    std::vector<float> chunk(static_cast<size_t>(chunk_frames) * channels);
+    while (producer_running.load(std::memory_order_relaxed)) {
+      if (!playback_active.load(std::memory_order_acquire)) {
+        producer_idle.store(true, std::memory_order_release);
+        std::this_thread::yield();
+        continue;
+      }
+      producer_idle.store(false, std::memory_order_release);
+
+      const uint32_t writable = ring_buffer.available_to_write_frames();
+      if (writable < chunk_frames) {
+        std::this_thread::yield();
+        continue;
+      }
+
+      FillSine(chunk.data(), chunk_frames, channels, &sine);
+      ring_buffer.write_frames(chunk.data(), chunk_frames);
+    }
+  });
+
+  const uint32_t drain_chunk_frames = 256;
+  std::vector<float> drain(static_cast<size_t>(drain_chunk_frames) * channels);
+
   for (int i = 0; i < options.repeat; ++i) {
+    playback_active.store(false, std::memory_order_release);
+    while (!producer_idle.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    while (true) {
+      const uint32_t available = ring_buffer.available_to_read_frames();
+      if (available == 0) {
+        break;
+      }
+      const uint32_t to_read =
+          available < drain_chunk_frames ? available : drain_chunk_frames;
+      ring_buffer.read_frames(drain.data(), to_read);
+    }
+    ring_buffer.reset();
+
+    playback_active.store(true, std::memory_order_release);
     if (!output.start()) {
       std::cerr << "Failed to start audio.\n";
       break;
@@ -182,8 +232,11 @@ int RunWasapiDemo(int argc, char* argv[]) {
 
     std::this_thread::sleep_for(std::chrono::duration<double>(options.seconds));
     output.stop();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
   }
+
+  playback_active.store(false, std::memory_order_release);
+  producer_running.store(false, std::memory_order_release);
+  producer.join();
 
   if (options.stress) {
     stress_running.store(false);

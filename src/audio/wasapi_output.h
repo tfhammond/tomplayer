@@ -18,19 +18,11 @@
 #include <windows.h>
 #include <wrl/client.h>
 
+class AudioRingBuffer;
+
 namespace tomplayer {
 namespace wasapi {
 
-// Summary: Render callback invoked on the real-time audio thread.
-// Preconditions: must be fast, allocation-free, and non-blocking; out is non-null.
-// Postconditions: writes up to frames * channels samples into out.
-// Errors: return false to request silence.
-using RenderCallback = bool (*)(float* out, uint32_t frames, uint32_t channels, void* user);
-
-// Summary: Supported mix formats for the device render buffer.
-// Preconditions: none.
-// Postconditions: none.
-// Errors: Unsupported means the render path will output silence.
 enum class SampleFormat {
   Float32,
   Pcm16,
@@ -56,13 +48,13 @@ struct StartStopApi {
 
 SampleFormat DetectSampleFormat(const WAVEFORMATEX* format);
 void ConvertFloatToPcm16(const float* in, int16_t* out, std::size_t samples);
-void RenderAudioCore(const RenderApi& api,
-                     RenderCallback callback,
-                     void* callback_user,
-                     uint32_t buffer_frames,
-                     uint32_t channels,
-                     SampleFormat format,
-                     float* float_scratch);
+// Read frames into dst and zero-fill any underrun tail; updates counters if provided.
+uint32_t ConsumeRingBufferFloat(AudioRingBuffer* ring_buffer,
+                                float* dst_interleaved,
+                                uint32_t frames_requested,
+                                uint32_t channels,
+                                std::atomic<uint64_t>* underrun_wakes,
+                                std::atomic<uint64_t>* underrun_frames);
 }  // namespace detail
 
 // Summary: WASAPI shared-mode output wrapper with event-driven render thread.
@@ -71,16 +63,6 @@ void RenderAudioCore(const RenderApi& api,
 // Errors: methods return false on initialization or start failures.
 class WasapiOutput {
 public:
-  // Summary: Render callback type used by this output.
-  // Preconditions: same as RenderCallback.
-  // Postconditions: none.
-  // Errors: return false to request silence.
-  using RenderCallback = ::tomplayer::wasapi::RenderCallback;
-
-  // Summary: Construct an uninitialized output object.
-  // Preconditions: none.
-  // Postconditions: must call init_default_device before start.
-  // Errors: none.
   WasapiOutput();
 
   // Summary: Shutdown and release resources.
@@ -92,16 +74,14 @@ public:
   WasapiOutput(const WasapiOutput&) = delete;
   WasapiOutput& operator=(const WasapiOutput&) = delete;
 
-  // Summary: Initialize using the default render device in shared mode.
-  // Preconditions: COM initialized and remains active for the caller thread.
-  // Postconditions: mix format cached and render thread can be started.
-  // Errors: returns false on WASAPI or COM failures; object is reset.
-  bool init_default_device(RenderCallback callback, void* user);
+  // COM must stay initialized on the caller thread while COM interfaces are in use.
+  bool init_default_device();
 
-  // Summary: Start event-driven rendering on a dedicated thread.
-  // Preconditions: init_default_device has succeeded and start() not already running.
-  // Postconditions: render thread active and audio client started.
-  // Errors: returns false on start failure without leaving the thread running.
+  // Set the ring buffer used by the render thread.
+  // Preconditions: must be called before start(); buffer outlives stop()/shutdown().
+  void set_ring_buffer(AudioRingBuffer* ring_buffer);
+
+  // Start requires init_default_device, a non-null ring buffer, and matching channels.
   bool start();
 
   // Summary: Stop rendering and join the render thread.
@@ -145,11 +125,23 @@ public:
   // Postconditions: none.
   // Errors: returns 0 if uninitialized.
   uint32_t buffer_frames() const { return buffer_frames_; }
+  // Summary: Number of render wakes that saw a short read.
+  // Preconditions: none.
+  // Postconditions: does not modify state.
+  // Errors: none.
+  uint64_t underrun_wake_count() const { return underrun_wake_count_.load(std::memory_order_relaxed); }
+
+  // Summary: Number of frames zero-filled due to underrun.
+  // Preconditions: none.
+  // Postconditions: does not modify state.
+  // Errors: none.
+  uint64_t underrun_frame_count() const { return underrun_frame_count_.load(std::memory_order_relaxed); }
 
 #if defined(TOMPLAYER_TESTING)
   void set_start_stop_api_for_test(const detail::StartStopApi& api,
                                    HANDLE audio_event,
                                    HANDLE stop_event);
+  void set_channels_for_test(uint16_t channels);
   bool is_running_for_test() const { return running_.load(std::memory_order_relaxed); }
 #endif
 
@@ -165,9 +157,6 @@ private:
   // Postconditions: buffer released or method returns early.
   // Errors: on failure, returns without rendering (silence handled by caller).
   void RenderAudio();
-
-  RenderCallback callback_{nullptr};
-  void* callback_user_{nullptr};
 
   Microsoft::WRL::ComPtr<IMMDevice> device_;
   Microsoft::WRL::ComPtr<IAudioClient> audio_client_;
@@ -196,6 +185,10 @@ private:
   detail::RenderApi render_api_{};
   detail::StartStopApi start_stop_api_{};
   RenderApiContext render_api_context_{};
+
+  AudioRingBuffer* ring_buffer_{nullptr};
+  std::atomic<uint64_t> underrun_wake_count_{0};
+  std::atomic<uint64_t> underrun_frame_count_{0};
 
   // Scratch space keeps PCM16 conversion off the heap during render.
   std::unique_ptr<float[]> float_scratch_;
