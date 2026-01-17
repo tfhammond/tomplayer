@@ -5,6 +5,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <atomic>
 #include <vector>
 
 #include <windows.h>
@@ -12,6 +13,7 @@
 #include <ksmedia.h>
 
 #include "audio/wasapi_output.h"
+#include "buffer/audio_ring_buffer.h"
 
 namespace {
 struct FakeRenderApi {
@@ -187,6 +189,38 @@ TEST_CASE("ConvertFloatToPcm16 clamps and scales") {
   REQUIRE(output[3] == -16383);
   REQUIRE(output[4] == 32767);
   REQUIRE(output[5] == -32767);
+}
+
+// Validates ring-buffer consumption zero-fills missing frames on underrun.
+TEST_CASE("ConsumeRingBufferFloat zero-fills tail on underrun") {
+  const uint32_t channels = 2;
+  AudioRingBuffer buffer(4, channels);
+  std::array<float, 4> input = {1.0f, 2.0f, 3.0f, 4.0f};
+  std::array<float, 8> output{};
+  std::atomic<uint64_t> underrun_wakes{0};
+  std::atomic<uint64_t> underrun_frames{0};
+
+  REQUIRE(buffer.write_frames(input.data(), 2) == 2);
+
+  const uint32_t frames_read = tomplayer::wasapi::detail::ConsumeRingBufferFloat(
+      &buffer,
+      output.data(),
+      4,
+      channels,
+      &underrun_wakes,
+      &underrun_frames);
+
+  REQUIRE(frames_read == 2);
+  REQUIRE(output[0] == 1.0f);
+  REQUIRE(output[1] == 2.0f);
+  REQUIRE(output[2] == 3.0f);
+  REQUIRE(output[3] == 4.0f);
+  REQUIRE(output[4] == 0.0f);
+  REQUIRE(output[5] == 0.0f);
+  REQUIRE(output[6] == 0.0f);
+  REQUIRE(output[7] == 0.0f);
+  REQUIRE(underrun_wakes.load() == 1);
+  REQUIRE(underrun_frames.load() == 2);
 }
 
 // Exercises render-path contract boundaries without any real WASAPI objects.
