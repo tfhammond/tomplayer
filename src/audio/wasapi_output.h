@@ -18,6 +18,8 @@
 #include <windows.h>
 #include <wrl/client.h>
 
+class AudioRingBuffer;
+
 namespace tomplayer {
 namespace wasapi {
 
@@ -70,6 +72,12 @@ public:
 
   // COM must stay initialized on the caller thread while COM interfaces are in use.
   bool init_default_device(RenderCallback callback, void* user);
+
+  // Set the ring buffer used by the render thread.
+  // Preconditions: must be called before start(); buffer outlives stop()/shutdown().
+  void set_ring_buffer(AudioRingBuffer* ring_buffer);
+
+  // Start requires init_default_device, a non-null ring buffer, and matching channels.
   bool start();
   void stop();
   void shutdown();
@@ -122,6 +130,8 @@ private:
   detail::RenderApi render_api_{};
   detail::StartStopApi start_stop_api_{};
   RenderApiContext render_api_context_{};
+
+  AudioRingBuffer* ring_buffer_{nullptr};
 
   // Scratch space keeps PCM16 conversion off the heap during render.
   std::unique_ptr<float[]> float_scratch_;

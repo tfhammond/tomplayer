@@ -1,7 +1,11 @@
 #include "audio/wasapi_output.h"
 
+#include "buffer/audio_ring_buffer.h"
+
 #include <avrt.h>
 #include <ksmedia.h>
+
+#include <cassert>
 
 namespace tomplayer {
 namespace wasapi {
@@ -104,6 +108,11 @@ WasapiOutput::WasapiOutput() = default;
 
 WasapiOutput::~WasapiOutput() {
   shutdown();
+}
+
+void WasapiOutput::set_ring_buffer(AudioRingBuffer* ring_buffer) {
+  assert(!running_.load(std::memory_order_relaxed));
+  ring_buffer_ = ring_buffer;
 }
 
 bool WasapiOutput::init_default_device(RenderCallback callback, void* user) {
@@ -223,6 +232,14 @@ bool WasapiOutput::init_default_device(RenderCallback callback, void* user) {
 bool WasapiOutput::start() {
   // Render client access stays on the render thread to avoid cross-thread COM calls.
   if (!start_stop_api_.Start || !audio_event_ || !stop_event_) {
+    return false;
+  }
+  assert(ring_buffer_ != nullptr);
+  if (!ring_buffer_) {
+    return false;
+  }
+  assert(ring_buffer_->channels() == channels_);
+  if (ring_buffer_->channels() != channels_) {
     return false;
   }
 
