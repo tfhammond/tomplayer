@@ -18,6 +18,12 @@ namespace tomplayer::engine {
 // Errors: None; commands are queued and processed asynchronously.
 class PlayerEngine {
 public:
+  // Summary: Decode control modes issued by the engine thread.
+  // Preconditions: None.
+  // Postconditions: Used for decode-thread coordination.
+  // Errors: None.
+  enum class DecodeMode { Stopped, Running, Paused, Quit };
+
   // Summary: Discrete playback states owned by the engine thread.
   // Preconditions: None.
   // Postconditions: Used for read-only observation from other threads.
@@ -45,6 +51,9 @@ public:
     double buffered_seconds = 0.0;
     uint64_t underrun_count = 0;
     uint64_t dropped_frames = 0;
+    uint64_t decode_epoch = 0;
+    DecodeMode decode_mode = DecodeMode::Stopped;
+    int64_t seek_target_frame = -1;
     std::string last_error;
   };
 
@@ -130,6 +139,20 @@ private:
   void Enqueue(Command command);
   void EngineLoop();
   void HandleCommand(const Command& command);
+  void bump_epoch();
+  void set_decode_mode(DecodeMode mode);
+  void set_target_frame(int64_t frame);
+
+  // Decode control is owned by the engine thread; atomics provide snapshots to readers.
+  // Epoch is a generation counter: any change that invalidates in-flight decode work
+  // increments it so a future decode thread can restart work safely.
+  struct DecodeControl {
+    std::atomic<uint64_t> epoch{0};
+    std::atomic<DecodeMode> mode{DecodeMode::Stopped};
+    
+    // Unit: PCM frames (one time step across all channels). -1 means no target.
+    std::atomic<int64_t> target_frame{-1};
+  };
 
   std::atomic<PlayerState> state_{PlayerState::Idle};
   std::atomic<double> position_seconds_{0.0};
@@ -143,6 +166,7 @@ private:
   // Mutable to allow locking in const accessors.
   mutable std::mutex last_error_mutex_;
   std::string last_error_;
+  DecodeControl decode_control_{};
 
   std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
