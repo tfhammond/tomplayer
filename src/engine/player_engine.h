@@ -3,8 +3,10 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <variant>
 
@@ -30,6 +32,20 @@ public:
     Stopping,
     Finished,
     Error
+  };
+
+  // Summary: Snapshot of playback state for UI consumers.
+  // Preconditions: None.
+  // Postconditions: Returned values are a point-in-time copy.
+  // Errors: None.
+  struct Status {
+    PlayerState state = PlayerState::Idle;
+    double position_seconds = 0.0;
+    double duration_seconds = 0.0;
+    double buffered_seconds = 0.0;
+    uint64_t underrun_count = 0;
+    uint64_t dropped_frames = 0;
+    std::string last_error;
   };
 
   PlayerEngine();
@@ -86,6 +102,12 @@ public:
   // Errors: None.
   PlayerState get_state() const;
 
+  // Summary: Return a snapshot of playback status suitable for UI display.
+  // Preconditions: None.
+  // Postconditions: Does not mutate state; returns a copy.
+  // Errors: None.
+  Status get_status() const;
+
 private:
   struct PlayCommand {};
   struct PauseCommand {};
@@ -110,7 +132,17 @@ private:
   void HandleCommand(const Command& command);
 
   std::atomic<PlayerState> state_{PlayerState::Idle};
+  std::atomic<double> position_seconds_{0.0};
+  std::atomic<double> duration_seconds_{0.0};
+  std::atomic<double> buffered_seconds_{0.0};
+  std::atomic<uint64_t> underrun_count_{0};
+  std::atomic<uint64_t> dropped_frames_{0};
   std::atomic<bool> running_{true};
+
+  // Protected by last_error_mutex_ because std::string is not atomic.
+  // Mutable to allow locking in const accessors.
+  mutable std::mutex last_error_mutex_;
+  std::string last_error_;
 
   std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
