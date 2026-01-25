@@ -54,6 +54,8 @@ public:
     uint64_t decode_epoch = 0;
     DecodeMode decode_mode = DecodeMode::Stopped;
     int64_t seek_target_frame = -1;
+    int64_t decoded_frame_cursor = 0;
+    uint64_t produced_frames_total = 0;
     std::string last_error;
   };
 
@@ -142,6 +144,7 @@ private:
   void bump_epoch();
   void set_decode_mode(DecodeMode mode);
   void set_target_frame(int64_t frame);
+  void DecodeLoop();
 
   // Decode control is owned by the engine thread; atomics provide snapshots to readers.
   // Epoch is a generation counter: any change that invalidates in-flight decode work
@@ -167,12 +170,15 @@ private:
   mutable std::mutex last_error_mutex_;
   std::string last_error_;
   DecodeControl decode_control_{};
+  std::atomic<int64_t> decoded_frame_cursor_{0};
+  std::atomic<uint64_t> produced_frames_total_{0};
 
   std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
   std::deque<Command> queue_;
 
   std::thread engine_thread_;
+  std::thread decode_thread_;
 };
 
 }  // namespace tomplayer::engine

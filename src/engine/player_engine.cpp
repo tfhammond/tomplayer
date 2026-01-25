@@ -7,13 +7,18 @@
 namespace tomplayer::engine {
 
 PlayerEngine::PlayerEngine() {
+  // Start background threads immediately; they exit cleanly on Quit.
   engine_thread_ = std::thread(&PlayerEngine::EngineLoop, this);
+  decode_thread_ = std::thread(&PlayerEngine::DecodeLoop, this);
 }
 
 PlayerEngine::~PlayerEngine() {
   quit();
   if (engine_thread_.joinable()) {
     engine_thread_.join();
+  }
+  if (decode_thread_.joinable()) {
+    decode_thread_.join();
   }
 }
 
@@ -65,6 +70,10 @@ PlayerEngine::Status PlayerEngine::get_status() const {
   snapshot.decode_mode = decode_control_.mode.load(std::memory_order_acquire);
   snapshot.seek_target_frame =
       decode_control_.target_frame.load(std::memory_order_acquire);
+  snapshot.decoded_frame_cursor =
+      decoded_frame_cursor_.load(std::memory_order_acquire);
+  snapshot.produced_frames_total =
+      produced_frames_total_.load(std::memory_order_acquire);
   {
     std::lock_guard<std::mutex> lock(last_error_mutex_);
     snapshot.last_error = last_error_;
@@ -144,6 +153,7 @@ void PlayerEngine::HandleCommand(const Command& command) {
   }
   if (std::holds_alternative<SeekCommand>(command)) {
     constexpr int64_t placeholder_sample_rate_hz = 48000;
+    const PlayerState prior_state = state_.load(std::memory_order_acquire);
     state_.store(PlayerState::Seeking, std::memory_order_release);
     const auto seek = std::get<SeekCommand>(command);
     const double clamped = std::max(0.0, seek.seconds);
@@ -152,8 +162,13 @@ void PlayerEngine::HandleCommand(const Command& command) {
         static_cast<int64_t>(clamped * static_cast<double>(placeholder_sample_rate_hz));
     bump_epoch();
     set_target_frame(frames);
-    set_decode_mode(DecodeMode::Running);
-    state_.store(PlayerState::Playing, std::memory_order_release);
+    if (prior_state == PlayerState::Paused) {
+      set_decode_mode(DecodeMode::Paused);
+      state_.store(PlayerState::Paused, std::memory_order_release);
+    } else {
+      set_decode_mode(DecodeMode::Running);
+      state_.store(PlayerState::Playing, std::memory_order_release);
+    }
     return;
   }
   if (std::holds_alternative<ReplayCommand>(command)) {
@@ -177,6 +192,48 @@ void PlayerEngine::set_decode_mode(DecodeMode mode) {
 
 void PlayerEngine::set_target_frame(int64_t frame) {
   decode_control_.target_frame.store(frame, std::memory_order_release);
+}
+
+void PlayerEngine::DecodeLoop() {
+  constexpr int64_t placeholder_sample_rate_hz = 48000;
+  constexpr int64_t chunk_frames = 1024;
+  const auto chunk_duration =
+      std::chrono::duration<double>(static_cast<double>(chunk_frames) /
+                                    static_cast<double>(placeholder_sample_rate_hz));
+
+  uint64_t local_epoch = decode_control_.epoch.load(std::memory_order_acquire);
+  int64_t local_cursor_frame = 0;
+  decoded_frame_cursor_.store(local_cursor_frame, std::memory_order_release);
+
+  while (true) {
+    const DecodeMode mode = decode_control_.mode.load(std::memory_order_acquire);
+    if (mode == DecodeMode::Quit) {
+      break;
+    }
+
+    const uint64_t current_epoch =
+        decode_control_.epoch.load(std::memory_order_acquire);
+    if (current_epoch != local_epoch) {
+      local_epoch = current_epoch;
+      const int64_t target =
+          decode_control_.target_frame.load(std::memory_order_acquire);
+      local_cursor_frame = target >= 0 ? target : 0;
+      decoded_frame_cursor_.store(local_cursor_frame, std::memory_order_release);
+    }
+
+    if (mode == DecodeMode::Stopped || mode == DecodeMode::Paused) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      continue;
+    }
+
+    if (mode == DecodeMode::Running) {
+      local_cursor_frame += chunk_frames;
+      decoded_frame_cursor_.store(local_cursor_frame, std::memory_order_release);
+      produced_frames_total_.fetch_add(static_cast<uint64_t>(chunk_frames),
+                                       std::memory_order_acq_rel);
+      std::this_thread::sleep_for(chunk_duration);
+    }
+  }
 }
 
 }  // namespace tomplayer::engine
