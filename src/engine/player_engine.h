@@ -10,6 +10,8 @@
 #include <thread>
 #include <variant>
 
+#include "buffer/audio_ring_buffer.h"
+
 namespace tomplayer::engine {
 
 // Summary: Playback state machine owned exclusively by the engine thread.
@@ -120,6 +122,11 @@ public:
   Status get_status() const;
 
 private:
+  // Placeholder device format for the stub pipeline.
+  static constexpr uint32_t kSampleRateHz = 48000;
+  static constexpr uint32_t kChannels = 2;
+  static constexpr uint32_t kCapacityFrames = kSampleRateHz * 2;
+
   struct PlayCommand {};
   struct PauseCommand {};
   struct ResumeCommand {};
@@ -172,6 +179,8 @@ private:
   DecodeControl decode_control_{};
   std::atomic<int64_t> decoded_frame_cursor_{0};
   std::atomic<uint64_t> produced_frames_total_{0};
+  // Frame = one time-step across all channels (interleaved float32 layout).
+  AudioRingBuffer ring_buffer_{kCapacityFrames, kChannels};
 
   std::mutex queue_mutex_;
   std::condition_variable queue_cv_;

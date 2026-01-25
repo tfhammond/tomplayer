@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <utility>
+#include <vector>
 
 namespace tomplayer::engine {
 
@@ -122,6 +123,10 @@ void PlayerEngine::EngineLoop() {
       const double current = position_seconds_.load(std::memory_order_acquire);
       position_seconds_.store(current + elapsed.count(), std::memory_order_release);
     }
+    const double buffered_seconds =
+        static_cast<double>(ring_buffer_.available_to_read_frames()) /
+        static_cast<double>(kSampleRateHz);
+    buffered_seconds_.store(buffered_seconds, std::memory_order_release);
     last_tick = now;
   }
 }
@@ -146,6 +151,7 @@ void PlayerEngine::HandleCommand(const Command& command) {
   if (std::holds_alternative<StopCommand>(command)) {
     state_.store(PlayerState::Stopped, std::memory_order_release);
     position_seconds_.store(0.0, std::memory_order_release);
+    ring_buffer_.reset();
     bump_epoch();
     set_decode_mode(DecodeMode::Stopped);
     set_target_frame(-1);
@@ -169,6 +175,7 @@ void PlayerEngine::HandleCommand(const Command& command) {
       set_decode_mode(DecodeMode::Running);
       state_.store(PlayerState::Playing, std::memory_order_release);
     }
+    ring_buffer_.reset();
     return;
   }
   if (std::holds_alternative<ReplayCommand>(command)) {
@@ -195,15 +202,15 @@ void PlayerEngine::set_target_frame(int64_t frame) {
 }
 
 void PlayerEngine::DecodeLoop() {
-  constexpr int64_t placeholder_sample_rate_hz = 48000;
   constexpr int64_t chunk_frames = 1024;
   const auto chunk_duration =
       std::chrono::duration<double>(static_cast<double>(chunk_frames) /
-                                    static_cast<double>(placeholder_sample_rate_hz));
+                                    static_cast<double>(kSampleRateHz));
 
   uint64_t local_epoch = decode_control_.epoch.load(std::memory_order_acquire);
   int64_t local_cursor_frame = 0;
   decoded_frame_cursor_.store(local_cursor_frame, std::memory_order_release);
+  std::vector<float> silence(static_cast<size_t>(chunk_frames) * kChannels, 0.0f);
 
   while (true) {
     const DecodeMode mode = decode_control_.mode.load(std::memory_order_acquire);
@@ -227,11 +234,27 @@ void PlayerEngine::DecodeLoop() {
     }
 
     if (mode == DecodeMode::Running) {
-      local_cursor_frame += chunk_frames;
+      const uint32_t written = ring_buffer_.write_frames(
+          silence.data(),
+          static_cast<uint32_t>(chunk_frames));
+      if (written < static_cast<uint32_t>(chunk_frames)) {
+        dropped_frames_.fetch_add(static_cast<uint64_t>(chunk_frames - written),
+                                  std::memory_order_acq_rel);
+      }
+      if (written == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        continue;
+      }
+
+      local_cursor_frame += written;
       decoded_frame_cursor_.store(local_cursor_frame, std::memory_order_release);
-      produced_frames_total_.fetch_add(static_cast<uint64_t>(chunk_frames),
+      produced_frames_total_.fetch_add(static_cast<uint64_t>(written),
                                        std::memory_order_acq_rel);
-      std::this_thread::sleep_for(chunk_duration);
+
+      const auto written_duration =
+          std::chrono::duration<double>(static_cast<double>(written) /
+                                        static_cast<double>(kSampleRateHz));
+      std::this_thread::sleep_for(written_duration);
     }
   }
 }
