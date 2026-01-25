@@ -152,6 +152,9 @@ private:
   void set_decode_mode(DecodeMode mode);
   void set_target_frame(int64_t frame);
   void DecodeLoop();
+  void WaitForDecodeIdle();
+  void DrainRingBuffer();
+  void SetDecodeIdle(bool idle);
 
   // Decode control is owned by the engine thread; atomics provide snapshots to readers.
   // Epoch is a generation counter: any change that invalidates in-flight decode work
@@ -185,6 +188,10 @@ private:
   std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
   std::deque<Command> queue_;
+
+  std::atomic<bool> decode_idle_{true};
+  std::mutex decode_idle_mutex_;
+  std::condition_variable decode_idle_cv_;
 
   std::thread engine_thread_;
   std::thread decode_thread_;

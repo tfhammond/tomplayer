@@ -151,9 +151,12 @@ void PlayerEngine::HandleCommand(const Command& command) {
   if (std::holds_alternative<StopCommand>(command)) {
     state_.store(PlayerState::Stopped, std::memory_order_release);
     position_seconds_.store(0.0, std::memory_order_release);
-    ring_buffer_.reset();
-    bump_epoch();
     set_decode_mode(DecodeMode::Stopped);
+    WaitForDecodeIdle();
+    DrainRingBuffer();
+    ring_buffer_.reset();
+    buffered_seconds_.store(0.0, std::memory_order_release);
+    bump_epoch();
     set_target_frame(-1);
     return;
   }
@@ -166,16 +169,19 @@ void PlayerEngine::HandleCommand(const Command& command) {
     position_seconds_.store(clamped, std::memory_order_release);
     const int64_t frames =
         static_cast<int64_t>(clamped * static_cast<double>(placeholder_sample_rate_hz));
+    const DecodeMode desired_mode =
+        prior_state == PlayerState::Paused ? DecodeMode::Paused : DecodeMode::Running;
+    set_decode_mode(DecodeMode::Paused);
+    WaitForDecodeIdle();
+    DrainRingBuffer();
+    ring_buffer_.reset();
+    buffered_seconds_.store(0.0, std::memory_order_release);
     bump_epoch();
     set_target_frame(frames);
-    if (prior_state == PlayerState::Paused) {
-      set_decode_mode(DecodeMode::Paused);
-      state_.store(PlayerState::Paused, std::memory_order_release);
-    } else {
-      set_decode_mode(DecodeMode::Running);
-      state_.store(PlayerState::Playing, std::memory_order_release);
-    }
-    ring_buffer_.reset();
+    set_decode_mode(desired_mode);
+    state_.store(prior_state == PlayerState::Paused ? PlayerState::Paused
+                                                    : PlayerState::Playing,
+                 std::memory_order_release);
     return;
   }
   if (std::holds_alternative<ReplayCommand>(command)) {
@@ -215,6 +221,7 @@ void PlayerEngine::DecodeLoop() {
   while (true) {
     const DecodeMode mode = decode_control_.mode.load(std::memory_order_acquire);
     if (mode == DecodeMode::Quit) {
+      SetDecodeIdle(true);
       break;
     }
 
@@ -229,11 +236,13 @@ void PlayerEngine::DecodeLoop() {
     }
 
     if (mode == DecodeMode::Stopped || mode == DecodeMode::Paused) {
+      SetDecodeIdle(true);
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
       continue;
     }
 
     if (mode == DecodeMode::Running) {
+      SetDecodeIdle(false);
       const uint32_t written = ring_buffer_.write_frames(
           silence.data(),
           static_cast<uint32_t>(chunk_frames));
@@ -256,6 +265,37 @@ void PlayerEngine::DecodeLoop() {
                                         static_cast<double>(kSampleRateHz));
       std::this_thread::sleep_for(written_duration);
     }
+  }
+}
+
+void PlayerEngine::WaitForDecodeIdle() {
+  if (decode_idle_.load(std::memory_order_acquire)) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(decode_idle_mutex_);
+  decode_idle_cv_.wait(lock, [this] {
+    return decode_idle_.load(std::memory_order_acquire);
+  });
+}
+
+void PlayerEngine::DrainRingBuffer() {
+  constexpr uint32_t kDrainChunkFrames = 1024;
+  std::vector<float> scratch(static_cast<size_t>(kDrainChunkFrames) * kChannels, 0.0f);
+  while (true) {
+    const uint32_t available = ring_buffer_.available_to_read_frames();
+    if (available == 0) {
+      break;
+    }
+    const uint32_t to_read =
+        available < kDrainChunkFrames ? available : kDrainChunkFrames;
+    ring_buffer_.read_frames(scratch.data(), to_read);
+  }
+}
+
+void PlayerEngine::SetDecodeIdle(bool idle) {
+  const bool was_idle = decode_idle_.exchange(idle, std::memory_order_release);
+  if (idle && !was_idle) {
+    decode_idle_cv_.notify_all();
   }
 }
 
