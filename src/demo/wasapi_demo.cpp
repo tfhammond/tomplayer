@@ -18,6 +18,7 @@
 
 #include "audio/wasapi_output.h"
 #include "buffer/audio_ring_buffer.h"
+#include "engine/player_engine.h"
 
 namespace demo {
 namespace {
@@ -27,6 +28,7 @@ struct DemoOptions {
   int repeat = 3;
   double seconds = 2.0;
   bool stress = false;
+  bool engine_smoke = false;
   float frequency = 440.0f;
   bool show_help = false;
 };
@@ -43,6 +45,7 @@ void PrintUsage(std::string_view exe_name) {
             << "  --seconds N    Seconds per cycle (default: 2.0)\n"
             << "  --frequency N  Tone frequency in Hz (default: 440)\n"
             << "  --stress       Run CPU load during playback\n"
+            << "  --engine_smoke Run PlayerEngine smoke test\n"
             << "  --help         Show this help\n";
 }
 
@@ -76,6 +79,10 @@ bool ParseArgs(int argc, char* argv[], DemoOptions* options) {
     }
     if (arg == "--stress") {
       options->stress = true;
+      continue;
+    }
+    if (arg == "--engine_smoke") {
+      options->engine_smoke = true;
       continue;
     }
 
@@ -124,6 +131,21 @@ void StressWorker(std::atomic<bool>* running) {
     }
   }
 }
+
+void PrintEngineStatus(const char* label,
+                       const tomplayer::engine::PlayerEngine& engine) {
+  const auto status = engine.get_status();
+  std::cout << label
+            << " state=" << static_cast<int>(status.state)
+            << " position=" << status.position_seconds
+            << " decode_epoch=" << status.decode_epoch
+            << " decode_mode=" << static_cast<int>(status.decode_mode)
+            << " seek_target_frame=" << status.seek_target_frame;
+  if (!status.last_error.empty()) {
+    std::cout << " error=" << status.last_error;
+  }
+  std::cout << "\n";
+}
 }  // namespace
 
 int RunWasapiDemo(int argc, char* argv[]) {
@@ -134,6 +156,36 @@ int RunWasapiDemo(int argc, char* argv[]) {
   }
   if (options.show_help) {
     PrintUsage(argv[0]);
+    return 0;
+  }
+
+  if (options.engine_smoke) {
+    tomplayer::engine::PlayerEngine engine;
+    PrintEngineStatus("startup", engine);
+
+    engine.play();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    PrintEngineStatus("after play", engine);
+
+    engine.seek_seconds(10.0);
+    engine.seek_seconds(30.0);
+    engine.seek_seconds(5.0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    PrintEngineStatus("after seeks", engine);
+
+    engine.pause();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    PrintEngineStatus("after pause", engine);
+
+    engine.resume();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    PrintEngineStatus("after resume", engine);
+
+    engine.stop();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    PrintEngineStatus("after stop", engine);
+
+    engine.quit();
     return 0;
   }
 
