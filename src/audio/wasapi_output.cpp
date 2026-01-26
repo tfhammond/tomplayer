@@ -410,6 +410,7 @@ void WasapiOutput::RenderAudio() {
     return;
   }
 
+  // if not float32 then play silence (avoids garbage noise)
   if (sample_format_ != SampleFormat::Float32) {
     render_api_.ReleaseBuffer(render_api_.context, frames_available, AUDCLNT_BUFFERFLAGS_SILENT);
     return;
@@ -425,6 +426,8 @@ void WasapiOutput::RenderAudio() {
 
   const DWORD flags = frames_read == 0 ? AUDCLNT_BUFFERFLAGS_SILENT : 0;
   render_api_.ReleaseBuffer(render_api_.context, frames_available, flags);
+  // Count all frames handed to WASAPI, including silence, to track playback clock.
+  rendered_frames_total_.fetch_add(frames_available, std::memory_order_relaxed);
 }
 
 #if defined(TOMPLAYER_TESTING)

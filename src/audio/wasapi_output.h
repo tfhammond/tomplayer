@@ -105,6 +105,20 @@ public:
   // Errors: none.
   uint64_t underrun_frame_count() const { return underrun_frame_count_.load(std::memory_order_relaxed); }
 
+  // Summary: Number of frames handed to WASAPI since last reset.
+  // Preconditions: none.
+  // Postconditions: does not modify state.
+  // Errors: none.
+  uint64_t rendered_frames_total() const {
+    return rendered_frames_total_.load(std::memory_order_relaxed);
+  }
+
+  // Summary: Reset rendered frame counter (engine-thread only).
+  // Preconditions: render thread stopped or quiescent.
+  // Postconditions: rendered_frames_total returns 0.
+  // Errors: none.
+  void reset_rendered_frames() { rendered_frames_total_.store(0, std::memory_order_relaxed); }
+
 #if defined(TOMPLAYER_TESTING)
   void set_start_stop_api_for_test(const detail::StartStopApi& api,
                                    HANDLE audio_event,
@@ -150,6 +164,7 @@ private:
   AudioRingBuffer* ring_buffer_{nullptr};
   std::atomic<uint64_t> underrun_wake_count_{0};
   std::atomic<uint64_t> underrun_frame_count_{0};
+  std::atomic<uint64_t> rendered_frames_total_{0};
 };
 
 }  // namespace wasapi
