@@ -5,12 +5,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <variant>
 
 #include "buffer/audio_ring_buffer.h"
+#include "audio/wasapi_output.h"
 
 namespace tomplayer::engine {
 
@@ -51,7 +53,8 @@ public:
     double position_seconds = 0.0;
     double duration_seconds = 0.0;
     double buffered_seconds = 0.0;
-    uint64_t underrun_count = 0;
+    uint64_t underrun_wake_count = 0;
+    uint64_t underrun_frames_total = 0;
     uint64_t dropped_frames = 0;
     uint64_t decode_epoch = 0;
     DecodeMode decode_mode = DecodeMode::Stopped;
@@ -122,10 +125,8 @@ public:
   Status get_status() const;
 
 private:
-  // Placeholder device format for the stub pipeline.
-  static constexpr uint32_t kSampleRateHz = 48000;
-  static constexpr uint32_t kChannels = 2;
-  static constexpr uint32_t kCapacityFrames = kSampleRateHz * 2;
+  static constexpr uint32_t kDefaultSampleRateHz = 48000;
+  static constexpr uint32_t kDefaultChannels = 2;
 
   struct PlayCommand {};
   struct PauseCommand {};
@@ -155,6 +156,8 @@ private:
   void WaitForDecodeIdle();
   void DrainRingBuffer();
   void SetDecodeIdle(bool idle);
+  bool EnsureOutputInitialized();
+  bool PrimeAndStart(uint32_t threshold_frames, bool allow_empty);
 
   // Decode control is owned by the engine thread; atomics provide snapshots to readers.
   // Epoch is a generation counter: any change that invalidates in-flight decode work
@@ -168,12 +171,13 @@ private:
   };
 
   std::atomic<PlayerState> state_{PlayerState::Idle};
-  std::atomic<double> position_seconds_{0.0};
   std::atomic<double> duration_seconds_{0.0};
   std::atomic<double> buffered_seconds_{0.0};
-  std::atomic<uint64_t> underrun_count_{0};
   std::atomic<uint64_t> dropped_frames_{0};
   std::atomic<bool> running_{true};
+  std::atomic<uint32_t> sample_rate_hz_{kDefaultSampleRateHz};
+  std::atomic<uint32_t> channels_{kDefaultChannels};
+  std::atomic<int64_t> render_frame_offset_{0};
 
   // Protected by last_error_mutex_ because std::string is not atomic.
   // Mutable to allow locking in const accessors.
@@ -183,11 +187,18 @@ private:
   std::atomic<int64_t> decoded_frame_cursor_{0};
   std::atomic<uint64_t> produced_frames_total_{0};
   // Frame = one time-step across all channels (interleaved float32 layout).
-  AudioRingBuffer ring_buffer_{kCapacityFrames, kChannels};
+  std::unique_ptr<AudioRingBuffer> ring_buffer_;
+  std::unique_ptr<tomplayer::wasapi::WasapiOutput> output_;
+  bool output_initialized_{false};
 
   std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
   std::deque<Command> queue_;
+  std::atomic<bool> queue_has_pending_{false};
+
+  std::mutex buffer_mutex_;
+  std::condition_variable buffer_cv_;
+  std::atomic<uint64_t> buffer_write_seq_{0};
 
   std::atomic<bool> decode_idle_{true};
   std::mutex decode_idle_mutex_;
@@ -195,6 +206,8 @@ private:
 
   std::thread engine_thread_;
   std::thread decode_thread_;
+
+  bool start_in_progress_{false};
 };
 
 }  // namespace tomplayer::engine
