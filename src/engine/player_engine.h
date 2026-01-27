@@ -7,12 +7,13 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <variant>
 
-#include "buffer/audio_ring_buffer.h"
 #include "audio/wasapi_output.h"
+#include "buffer/audio_ring_buffer.h"
 
 namespace tomplayer::engine {
 
@@ -158,6 +159,13 @@ private:
   void SetDecodeIdle(bool idle);
   bool EnsureOutputInitialized();
   bool PrimeAndStart(uint32_t threshold_frames, bool allow_empty);
+  void StopOutputAndResetRenderedFrames();
+  void PauseDecodeAndWaitIdle();
+  void StopDecodeAndWaitIdle();
+  void ResetBufferingState();
+  void BeginNewDecodeEpochAndSetTarget(std::optional<int64_t> target_frame);
+  void CommitPaused();
+  bool StartPlaybackWithPriming(uint32_t threshold_frames, bool allow_empty);
 
   // Decode control is owned by the engine thread; atomics provide snapshots to readers.
   // Epoch is a generation counter: any change that invalidates in-flight decode work
@@ -198,7 +206,6 @@ private:
 
   std::mutex buffer_mutex_;
   std::condition_variable buffer_cv_;
-  std::atomic<uint64_t> buffer_write_seq_{0};
 
   std::atomic<bool> decode_idle_{true};
   std::mutex decode_idle_mutex_;
@@ -206,8 +213,6 @@ private:
 
   std::thread engine_thread_;
   std::thread decode_thread_;
-
-  bool start_in_progress_{false};
 };
 
 }  // namespace tomplayer::engine

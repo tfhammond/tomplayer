@@ -168,13 +168,10 @@ void PlayerEngine::HandleCommand(const Command& command) {
   // Placeholder transitions for v1 skeleton. Actual logic is engine-owned only.
   if (std::holds_alternative<PlayCommand>(command)) {
     state_.store(PlayerState::Starting, std::memory_order_release);
-    if (!EnsureOutputInitialized()) {
-      state_.store(PlayerState::Error, std::memory_order_release);
-      return;
-    }
     set_decode_mode(DecodeMode::Running);
-    if (PrimeAndStart(static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 5),
-                      false)) {
+    const uint32_t threshold_frames =
+        static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 5);
+    if (StartPlaybackWithPriming(threshold_frames, false)) {
       state_.store(PlayerState::Playing, std::memory_order_release);
     } else {
       state_.store(PlayerState::Error, std::memory_order_release);
@@ -182,22 +179,15 @@ void PlayerEngine::HandleCommand(const Command& command) {
     return;
   }
   if (std::holds_alternative<PauseCommand>(command)) {
-    if (output_) {
-      output_->stop();
-    }
-    state_.store(PlayerState::Paused, std::memory_order_release);
-    set_decode_mode(DecodeMode::Paused);
+    CommitPaused();
     return;
   }
   if (std::holds_alternative<ResumeCommand>(command)) {
     state_.store(PlayerState::Starting, std::memory_order_release);
-    if (!EnsureOutputInitialized()) {
-      state_.store(PlayerState::Error, std::memory_order_release);
-      return;
-    }
     set_decode_mode(DecodeMode::Running);
-    if (PrimeAndStart(static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 20),
-                      true)) {
+    const uint32_t threshold_frames =
+        static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 20);
+    if (StartPlaybackWithPriming(threshold_frames, true)) {
       state_.store(PlayerState::Playing, std::memory_order_release);
     } else {
       state_.store(PlayerState::Error, std::memory_order_release);
@@ -205,21 +195,12 @@ void PlayerEngine::HandleCommand(const Command& command) {
     return;
   }
   if (std::holds_alternative<StopCommand>(command)) {
-    if (output_) {
-      output_->stop();
-      output_->reset_rendered_frames();
-    }
+    StopOutputAndResetRenderedFrames();
     state_.store(PlayerState::Stopped, std::memory_order_release);
     render_frame_offset_.store(0, std::memory_order_release);
-    set_decode_mode(DecodeMode::Stopped);
-    WaitForDecodeIdle();
-    DrainRingBuffer();
-    if (ring_buffer_) {
-      ring_buffer_->reset();
-    }
-    buffered_seconds_.store(0.0, std::memory_order_release);
-    bump_epoch();
-    set_target_frame(-1);
+    StopDecodeAndWaitIdle();
+    ResetBufferingState();
+    BeginNewDecodeEpochAndSetTarget(std::nullopt);
     return;
   }
   if (std::holds_alternative<SeekCommand>(command)) {
@@ -233,30 +214,19 @@ void PlayerEngine::HandleCommand(const Command& command) {
                                               sample_rate_hz_.load(std::memory_order_acquire))));
     const DecodeMode desired_mode =
         prior_state == PlayerState::Paused ? DecodeMode::Paused : DecodeMode::Running;
-    if (output_) {
-      if (prior_state == PlayerState::Playing) {
-        output_->stop();
-      }
-      output_->reset_rendered_frames();
-    }
+    StopOutputAndResetRenderedFrames();
     render_frame_offset_.store(frames, std::memory_order_release);
-    set_decode_mode(DecodeMode::Paused);
-    WaitForDecodeIdle();
-    DrainRingBuffer();
-    if (ring_buffer_) {
-      ring_buffer_->reset();
-    }
-    buffered_seconds_.store(0.0, std::memory_order_release);
-    bump_epoch();
-    set_target_frame(frames);
+    PauseDecodeAndWaitIdle();
+    ResetBufferingState();
+    BeginNewDecodeEpochAndSetTarget(frames);
     if (desired_mode == DecodeMode::Paused) {
-      set_decode_mode(DecodeMode::Paused);
-      state_.store(PlayerState::Paused, std::memory_order_release);
+      CommitPaused();
     } else {
       set_decode_mode(DecodeMode::Running);
       state_.store(PlayerState::Starting, std::memory_order_release);
-      if (PrimeAndStart(static_cast<uint32_t>(
-              sample_rate_hz_.load(std::memory_order_acquire) / 5), false)) {
+      const uint32_t threshold_frames =
+          static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 5);
+      if (StartPlaybackWithPriming(threshold_frames, false)) {
         state_.store(PlayerState::Playing, std::memory_order_release);
       } else {
         state_.store(PlayerState::Error, std::memory_order_release);
@@ -265,20 +235,15 @@ void PlayerEngine::HandleCommand(const Command& command) {
     return;
   }
   if (std::holds_alternative<ReplayCommand>(command)) {
-    if (output_) {
-      output_->stop();
-      output_->reset_rendered_frames();
-    }
+    StopOutputAndResetRenderedFrames();
     state_.store(PlayerState::Starting, std::memory_order_release);
     render_frame_offset_.store(0, std::memory_order_release);
-    if (ring_buffer_) {
-      ring_buffer_->reset();
-    }
-    bump_epoch();
-    set_target_frame(0);
+    ResetBufferingState();
+    BeginNewDecodeEpochAndSetTarget(0);
     set_decode_mode(DecodeMode::Running);
-    if (PrimeAndStart(static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 5),
-                      false)) {
+    const uint32_t threshold_frames =
+        static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 5);
+    if (StartPlaybackWithPriming(threshold_frames, false)) {
       state_.store(PlayerState::Playing, std::memory_order_release);
     } else {
       state_.store(PlayerState::Error, std::memory_order_release);
@@ -297,6 +262,54 @@ void PlayerEngine::set_decode_mode(DecodeMode mode) {
 
 void PlayerEngine::set_target_frame(int64_t frame) {
   decode_control_.target_frame.store(frame, std::memory_order_release);
+}
+
+void PlayerEngine::StopOutputAndResetRenderedFrames() {
+  if (!output_) {
+    return;
+  }
+  // Keep the render clock consistent with explicit stop/seek/replay transitions.
+  output_->stop();
+  output_->reset_rendered_frames();
+}
+
+void PlayerEngine::PauseDecodeAndWaitIdle() {
+  set_decode_mode(DecodeMode::Paused);
+  WaitForDecodeIdle();
+}
+
+void PlayerEngine::StopDecodeAndWaitIdle() {
+  set_decode_mode(DecodeMode::Stopped);
+  WaitForDecodeIdle();
+}
+
+void PlayerEngine::ResetBufferingState() {
+  DrainRingBuffer();
+  if (ring_buffer_) {
+    ring_buffer_->reset();
+  }
+  buffered_seconds_.store(0.0, std::memory_order_release);
+}
+
+void PlayerEngine::BeginNewDecodeEpochAndSetTarget(std::optional<int64_t> target_frame) {
+  bump_epoch();
+  set_target_frame(target_frame.value_or(-1));
+}
+
+void PlayerEngine::CommitPaused() {
+  // Paused implies the output is stopped; decode mode is paused but buffers are retained.
+  if (output_) {
+    output_->stop();
+  }
+  state_.store(PlayerState::Paused, std::memory_order_release);
+  set_decode_mode(DecodeMode::Paused);
+}
+
+bool PlayerEngine::StartPlaybackWithPriming(uint32_t threshold_frames, bool allow_empty) {
+  if (!EnsureOutputInitialized()) {
+    return false;
+  }
+  return PrimeAndStart(threshold_frames, allow_empty);
 }
 
 void PlayerEngine::DecodeLoop() {
@@ -358,7 +371,9 @@ void PlayerEngine::DecodeLoop() {
         continue;
       }
 
-      buffer_write_seq_.fetch_add(1, std::memory_order_release);
+      {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+      }
       buffer_cv_.notify_all();
 
       local_cursor_frame += written;
@@ -445,68 +460,6 @@ bool PlayerEngine::EnsureOutputInitialized() {
   output_initialized_ = true;
   return true;
 }
-
-/*
-bool PlayerEngine::PrimeAndStart(uint32_t threshold_frames, bool allow_empty) {
-  if (!output_) {
-    return false;
-  }
-  if (!ring_buffer_) {
-    return false;
-  }
-
-  if (start_in_progress_) {
-    return false;
-  }
-  start_in_progress_ = true;
-  const uint32_t target = std::max<uint32_t>(threshold_frames, 1u);
-  const uint64_t start_seq = buffer_write_seq_.load(std::memory_order_acquire);
-  uint64_t local_seq = start_seq;
-
-  auto should_cancel = [this] {
-    return !running_.load(std::memory_order_acquire) ||
-           queue_has_pending_.load(std::memory_order_acquire) ||
-           state_.load(std::memory_order_acquire) != PlayerState::Starting;
-  };
-
-  while (true) {
-    const uint32_t available = ring_buffer_->available_to_read_frames();
-    if (available >= target) {
-      break;
-    }
-    if (should_cancel()) {
-      start_in_progress_ = false;
-      return false;
-    }
-
-    std::unique_lock<std::mutex> lock(buffer_mutex_);
-    buffer_cv_.wait_for(lock, std::chrono::milliseconds(50), [&] {
-      const uint64_t seq = buffer_write_seq_.load(std::memory_order_acquire);
-      if (seq != local_seq) {
-        local_seq = seq;
-        return true;
-      }
-      return should_cancel();
-    });
-  }
-
-  const uint32_t available = ring_buffer_->available_to_read_frames();
-  if (available < target) {
-    start_in_progress_ = false;
-    return false;
-  }
-
-  if (!output_->start()) {
-    std::lock_guard<std::mutex> lock(last_error_mutex_);
-    last_error_ = "Failed to start WASAPI output.";
-    start_in_progress_ = false;
-    return false;
-  }
-
-  start_in_progress_ = false;
-  return true;
-} 
-*/
 
 bool PlayerEngine::PrimeAndStart(uint32_t threshold_frames, bool allow_empty) {
   if (!output_) {
