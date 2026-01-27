@@ -2,12 +2,17 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <objbase.h>
 #include <utility>
 #include <vector>
 
 namespace tomplayer::engine {
 
 PlayerEngine::PlayerEngine() {
+  ring_buffer_ = std::make_unique<AudioRingBuffer>(kDefaultSampleRateHz * 2,
+                                                   kDefaultChannels);
+  output_ = std::make_unique<tomplayer::wasapi::WasapiOutput>();
   // Start background threads immediately; they exit cleanly on Quit.
   engine_thread_ = std::thread(&PlayerEngine::EngineLoop, this);
   decode_thread_ = std::thread(&PlayerEngine::DecodeLoop, this);
@@ -15,11 +20,11 @@ PlayerEngine::PlayerEngine() {
 
 PlayerEngine::~PlayerEngine() {
   quit();
-  if (engine_thread_.joinable()) {
-    engine_thread_.join();
-  }
   if (decode_thread_.joinable()) {
     decode_thread_.join();
+  }
+  if (engine_thread_.joinable()) {
+    engine_thread_.join();
   }
 }
 
@@ -62,10 +67,14 @@ PlayerEngine::PlayerState PlayerEngine::get_state() const {
 PlayerEngine::Status PlayerEngine::get_status() const {
   Status snapshot;
   snapshot.state = state_.load(std::memory_order_acquire);
-  snapshot.position_seconds = position_seconds_.load(std::memory_order_acquire);
   snapshot.duration_seconds = duration_seconds_.load(std::memory_order_acquire);
   snapshot.buffered_seconds = buffered_seconds_.load(std::memory_order_acquire);
-  snapshot.underrun_count = underrun_count_.load(std::memory_order_acquire);
+  snapshot.underrun_wake_count = 0;
+  snapshot.underrun_frames_total = 0;
+  if (output_) {
+    snapshot.underrun_wake_count = output_->underrun_wake_count();
+    snapshot.underrun_frames_total = output_->underrun_frame_count();
+  }
   snapshot.dropped_frames = dropped_frames_.load(std::memory_order_acquire);
   snapshot.decode_epoch = decode_control_.epoch.load(std::memory_order_acquire);
   snapshot.decode_mode = decode_control_.mode.load(std::memory_order_acquire);
@@ -75,6 +84,20 @@ PlayerEngine::Status PlayerEngine::get_status() const {
       decoded_frame_cursor_.load(std::memory_order_acquire);
   snapshot.produced_frames_total =
       produced_frames_total_.load(std::memory_order_acquire);
+  const uint32_t sample_rate = sample_rate_hz_.load(std::memory_order_acquire);
+  const int64_t offset_frames =
+      render_frame_offset_.load(std::memory_order_acquire);
+  uint64_t rendered_frames = 0;
+  if (output_) {
+    rendered_frames = output_->rendered_frames_total();
+  }
+  if (sample_rate > 0) {
+    snapshot.position_seconds =
+        static_cast<double>(rendered_frames + offset_frames) /
+        static_cast<double>(sample_rate);
+  } else {
+    snapshot.position_seconds = 0.0;
+  }
   {
     std::lock_guard<std::mutex> lock(last_error_mutex_);
     snapshot.last_error = last_error_;
@@ -87,12 +110,14 @@ void PlayerEngine::Enqueue(Command command) {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     queue_.push_back(std::move(command));
   }
+  queue_has_pending_.store(true, std::memory_order_release);
   queue_cv_.notify_one();
 }
 
 void PlayerEngine::EngineLoop() {
   // The engine thread is the sole owner of state transitions.
-  auto last_tick = std::chrono::steady_clock::now();
+  const HRESULT com_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  const bool com_should_uninit = SUCCEEDED(com_hr);
   while (true) {
     Command command;
     bool has_command = false;
@@ -105,6 +130,9 @@ void PlayerEngine::EngineLoop() {
         command = std::move(queue_.front());
         queue_.pop_front();
         has_command = true;
+        if (queue_.empty()) {
+          queue_has_pending_.store(false, std::memory_order_release);
+        }
       }
     }
 
@@ -112,85 +140,149 @@ void PlayerEngine::EngineLoop() {
       if (std::holds_alternative<QuitCommand>(command)) {
         set_decode_mode(DecodeMode::Quit);
         bump_epoch();
+        if (output_) {
+          output_->stop();
+          output_->shutdown();
+          output_initialized_ = false;
+        }
         break;
       }
       HandleCommand(command);
     }
 
-    const auto now = std::chrono::steady_clock::now();
-    const std::chrono::duration<double> elapsed = now - last_tick;
-    if (state_.load(std::memory_order_acquire) == PlayerState::Playing) {
-      const double current = position_seconds_.load(std::memory_order_acquire);
-      position_seconds_.store(current + elapsed.count(), std::memory_order_release);
-    }
+    const uint32_t sample_rate = sample_rate_hz_.load(std::memory_order_acquire);
     const double buffered_seconds =
-        static_cast<double>(ring_buffer_.available_to_read_frames()) /
-        static_cast<double>(kSampleRateHz);
+        ring_buffer_ && sample_rate > 0
+            ? static_cast<double>(ring_buffer_->available_to_read_frames()) /
+                  static_cast<double>(sample_rate)
+            : 0.0;
     buffered_seconds_.store(buffered_seconds, std::memory_order_release);
-    last_tick = now;
+  }
+
+  if (com_should_uninit) {
+    CoUninitialize();
   }
 }
 
 void PlayerEngine::HandleCommand(const Command& command) {
   // Placeholder transitions for v1 skeleton. Actual logic is engine-owned only.
   if (std::holds_alternative<PlayCommand>(command)) {
-    state_.store(PlayerState::Playing, std::memory_order_release);
+    state_.store(PlayerState::Starting, std::memory_order_release);
+    if (!EnsureOutputInitialized()) {
+      state_.store(PlayerState::Error, std::memory_order_release);
+      return;
+    }
     set_decode_mode(DecodeMode::Running);
+    if (PrimeAndStart(static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 5),
+                      false)) {
+      state_.store(PlayerState::Playing, std::memory_order_release);
+    } else {
+      state_.store(PlayerState::Error, std::memory_order_release);
+    }
     return;
   }
   if (std::holds_alternative<PauseCommand>(command)) {
+    if (output_) {
+      output_->stop();
+    }
     state_.store(PlayerState::Paused, std::memory_order_release);
     set_decode_mode(DecodeMode::Paused);
     return;
   }
   if (std::holds_alternative<ResumeCommand>(command)) {
-    state_.store(PlayerState::Playing, std::memory_order_release);
+    state_.store(PlayerState::Starting, std::memory_order_release);
+    if (!EnsureOutputInitialized()) {
+      state_.store(PlayerState::Error, std::memory_order_release);
+      return;
+    }
     set_decode_mode(DecodeMode::Running);
+    if (PrimeAndStart(static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 20),
+                      true)) {
+      state_.store(PlayerState::Playing, std::memory_order_release);
+    } else {
+      state_.store(PlayerState::Error, std::memory_order_release);
+    }
     return;
   }
   if (std::holds_alternative<StopCommand>(command)) {
+    if (output_) {
+      output_->stop();
+      output_->reset_rendered_frames();
+    }
     state_.store(PlayerState::Stopped, std::memory_order_release);
-    position_seconds_.store(0.0, std::memory_order_release);
+    render_frame_offset_.store(0, std::memory_order_release);
     set_decode_mode(DecodeMode::Stopped);
     WaitForDecodeIdle();
     DrainRingBuffer();
-    ring_buffer_.reset();
+    if (ring_buffer_) {
+      ring_buffer_->reset();
+    }
     buffered_seconds_.store(0.0, std::memory_order_release);
     bump_epoch();
     set_target_frame(-1);
     return;
   }
   if (std::holds_alternative<SeekCommand>(command)) {
-    constexpr int64_t placeholder_sample_rate_hz = 48000;
     const PlayerState prior_state = state_.load(std::memory_order_acquire);
     state_.store(PlayerState::Seeking, std::memory_order_release);
     const auto seek = std::get<SeekCommand>(command);
     const double clamped = std::max(0.0, seek.seconds);
-    position_seconds_.store(clamped, std::memory_order_release);
     const int64_t frames =
-        static_cast<int64_t>(clamped * static_cast<double>(placeholder_sample_rate_hz));
+        static_cast<int64_t>(std::llround(clamped *
+                                          static_cast<double>(
+                                              sample_rate_hz_.load(std::memory_order_acquire))));
     const DecodeMode desired_mode =
         prior_state == PlayerState::Paused ? DecodeMode::Paused : DecodeMode::Running;
+    if (output_) {
+      if (prior_state == PlayerState::Playing) {
+        output_->stop();
+      }
+      output_->reset_rendered_frames();
+    }
+    render_frame_offset_.store(frames, std::memory_order_release);
     set_decode_mode(DecodeMode::Paused);
     WaitForDecodeIdle();
     DrainRingBuffer();
-    ring_buffer_.reset();
+    if (ring_buffer_) {
+      ring_buffer_->reset();
+    }
     buffered_seconds_.store(0.0, std::memory_order_release);
     bump_epoch();
     set_target_frame(frames);
-    set_decode_mode(desired_mode);
-    state_.store(prior_state == PlayerState::Paused ? PlayerState::Paused
-                                                    : PlayerState::Playing,
-                 std::memory_order_release);
+    if (desired_mode == DecodeMode::Paused) {
+      set_decode_mode(DecodeMode::Paused);
+      state_.store(PlayerState::Paused, std::memory_order_release);
+    } else {
+      set_decode_mode(DecodeMode::Running);
+      state_.store(PlayerState::Starting, std::memory_order_release);
+      if (PrimeAndStart(static_cast<uint32_t>(
+              sample_rate_hz_.load(std::memory_order_acquire) / 5), false)) {
+        state_.store(PlayerState::Playing, std::memory_order_release);
+      } else {
+        state_.store(PlayerState::Error, std::memory_order_release);
+      }
+    }
     return;
   }
   if (std::holds_alternative<ReplayCommand>(command)) {
+    if (output_) {
+      output_->stop();
+      output_->reset_rendered_frames();
+    }
     state_.store(PlayerState::Starting, std::memory_order_release);
-    position_seconds_.store(0.0, std::memory_order_release);
+    render_frame_offset_.store(0, std::memory_order_release);
+    if (ring_buffer_) {
+      ring_buffer_->reset();
+    }
     bump_epoch();
     set_target_frame(0);
     set_decode_mode(DecodeMode::Running);
-    state_.store(PlayerState::Playing, std::memory_order_release);
+    if (PrimeAndStart(static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 5),
+                      false)) {
+      state_.store(PlayerState::Playing, std::memory_order_release);
+    } else {
+      state_.store(PlayerState::Error, std::memory_order_release);
+    }
     return;
   }
 }
@@ -209,14 +301,11 @@ void PlayerEngine::set_target_frame(int64_t frame) {
 
 void PlayerEngine::DecodeLoop() {
   constexpr int64_t chunk_frames = 1024;
-  const auto chunk_duration =
-      std::chrono::duration<double>(static_cast<double>(chunk_frames) /
-                                    static_cast<double>(kSampleRateHz));
-
   uint64_t local_epoch = decode_control_.epoch.load(std::memory_order_acquire);
   int64_t local_cursor_frame = 0;
   decoded_frame_cursor_.store(local_cursor_frame, std::memory_order_release);
-  std::vector<float> silence(static_cast<size_t>(chunk_frames) * kChannels, 0.0f);
+  uint32_t local_channels = channels_.load(std::memory_order_acquire);
+  std::vector<float> silence(static_cast<size_t>(chunk_frames) * local_channels, 0.0f);
 
   while (true) {
     const DecodeMode mode = decode_control_.mode.load(std::memory_order_acquire);
@@ -243,7 +332,21 @@ void PlayerEngine::DecodeLoop() {
 
     if (mode == DecodeMode::Running) {
       SetDecodeIdle(false);
-      const uint32_t written = ring_buffer_.write_frames(
+      if (!ring_buffer_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        continue;
+      }
+      const uint32_t current_rate = sample_rate_hz_.load(std::memory_order_acquire);
+      if (current_rate == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        continue;
+      }
+      const uint32_t current_channels = channels_.load(std::memory_order_acquire);
+      if (current_channels != local_channels) {
+        local_channels = current_channels;
+        silence.assign(static_cast<size_t>(chunk_frames) * local_channels, 0.0f);
+      }
+      const uint32_t written = ring_buffer_->write_frames(
           silence.data(),
           static_cast<uint32_t>(chunk_frames));
       if (written < static_cast<uint32_t>(chunk_frames)) {
@@ -255,6 +358,9 @@ void PlayerEngine::DecodeLoop() {
         continue;
       }
 
+      buffer_write_seq_.fetch_add(1, std::memory_order_release);
+      buffer_cv_.notify_all();
+
       local_cursor_frame += written;
       decoded_frame_cursor_.store(local_cursor_frame, std::memory_order_release);
       produced_frames_total_.fetch_add(static_cast<uint64_t>(written),
@@ -262,7 +368,7 @@ void PlayerEngine::DecodeLoop() {
 
       const auto written_duration =
           std::chrono::duration<double>(static_cast<double>(written) /
-                                        static_cast<double>(kSampleRateHz));
+                                        static_cast<double>(current_rate));
       std::this_thread::sleep_for(written_duration);
     }
   }
@@ -280,15 +386,19 @@ void PlayerEngine::WaitForDecodeIdle() {
 
 void PlayerEngine::DrainRingBuffer() {
   constexpr uint32_t kDrainChunkFrames = 1024;
-  std::vector<float> scratch(static_cast<size_t>(kDrainChunkFrames) * kChannels, 0.0f);
+  if (!ring_buffer_) {
+    return;
+  }
+  const uint32_t channels = channels_.load(std::memory_order_acquire);
+  std::vector<float> scratch(static_cast<size_t>(kDrainChunkFrames) * channels, 0.0f);
   while (true) {
-    const uint32_t available = ring_buffer_.available_to_read_frames();
+    const uint32_t available = ring_buffer_->available_to_read_frames();
     if (available == 0) {
       break;
     }
     const uint32_t to_read =
         available < kDrainChunkFrames ? available : kDrainChunkFrames;
-    ring_buffer_.read_frames(scratch.data(), to_read);
+    ring_buffer_->read_frames(scratch.data(), to_read);
   }
 }
 
@@ -297,6 +407,130 @@ void PlayerEngine::SetDecodeIdle(bool idle) {
   if (idle && !was_idle) {
     decode_idle_cv_.notify_all();
   }
+}
+
+bool PlayerEngine::EnsureOutputInitialized() {
+  if (output_initialized_) {
+    return true;
+  }
+  if (!output_) {
+    output_ = std::make_unique<tomplayer::wasapi::WasapiOutput>();
+  }
+  if (!output_->init_default_device()) {
+    std::lock_guard<std::mutex> lock(last_error_mutex_);
+    last_error_ = "Failed to initialize WASAPI output.";
+    return false;
+  }
+
+  const uint32_t device_rate = output_->sample_rate();
+  const uint32_t device_channels = output_->channels();
+  if (device_rate == 0 || device_channels == 0) {
+    std::lock_guard<std::mutex> lock(last_error_mutex_);
+    last_error_ = "Invalid WASAPI mix format.";
+    return false;
+  }
+
+  sample_rate_hz_.store(device_rate, std::memory_order_release);
+  channels_.store(device_channels, std::memory_order_release);
+
+  set_decode_mode(DecodeMode::Paused);
+  WaitForDecodeIdle();
+  DrainRingBuffer();
+  ring_buffer_ = std::make_unique<AudioRingBuffer>(device_rate * 2, device_channels);
+  output_->set_ring_buffer(ring_buffer_.get());
+  buffered_seconds_.store(0.0, std::memory_order_release);
+  render_frame_offset_.store(0, std::memory_order_release);
+  output_->reset_rendered_frames();
+
+  output_initialized_ = true;
+  return true;
+}
+
+/*
+bool PlayerEngine::PrimeAndStart(uint32_t threshold_frames, bool allow_empty) {
+  if (!output_) {
+    return false;
+  }
+  if (!ring_buffer_) {
+    return false;
+  }
+
+  if (start_in_progress_) {
+    return false;
+  }
+  start_in_progress_ = true;
+  const uint32_t target = std::max<uint32_t>(threshold_frames, 1u);
+  const uint64_t start_seq = buffer_write_seq_.load(std::memory_order_acquire);
+  uint64_t local_seq = start_seq;
+
+  auto should_cancel = [this] {
+    return !running_.load(std::memory_order_acquire) ||
+           queue_has_pending_.load(std::memory_order_acquire) ||
+           state_.load(std::memory_order_acquire) != PlayerState::Starting;
+  };
+
+  while (true) {
+    const uint32_t available = ring_buffer_->available_to_read_frames();
+    if (available >= target) {
+      break;
+    }
+    if (should_cancel()) {
+      start_in_progress_ = false;
+      return false;
+    }
+
+    std::unique_lock<std::mutex> lock(buffer_mutex_);
+    buffer_cv_.wait_for(lock, std::chrono::milliseconds(50), [&] {
+      const uint64_t seq = buffer_write_seq_.load(std::memory_order_acquire);
+      if (seq != local_seq) {
+        local_seq = seq;
+        return true;
+      }
+      return should_cancel();
+    });
+  }
+
+  const uint32_t available = ring_buffer_->available_to_read_frames();
+  if (available < target) {
+    start_in_progress_ = false;
+    return false;
+  }
+
+  if (!output_->start()) {
+    std::lock_guard<std::mutex> lock(last_error_mutex_);
+    last_error_ = "Failed to start WASAPI output.";
+    start_in_progress_ = false;
+    return false;
+  }
+
+  start_in_progress_ = false;
+  return true;
+} 
+*/
+
+bool PlayerEngine::PrimeAndStart(uint32_t threshold_frames, bool allow_empty) {
+  if (!output_) {
+    return false;
+  }
+  if (!ring_buffer_) {
+    return false;
+  }
+
+  const uint32_t target = threshold_frames;
+  while (ring_buffer_->available_to_read_frames() < target) {
+    if (allow_empty && ring_buffer_->available_to_read_frames() == 0) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  if (!output_->start()) {
+    std::lock_guard<std::mutex> lock(last_error_mutex_);
+    last_error_ = "Failed to start WASAPI output.";
+    return false;
+  }
+
+  return true;
 }
 
 }  // namespace tomplayer::engine
