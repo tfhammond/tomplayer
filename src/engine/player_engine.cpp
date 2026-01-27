@@ -309,6 +309,7 @@ bool PlayerEngine::StartPlaybackWithPriming(uint32_t threshold_frames, bool allo
   if (!EnsureOutputInitialized()) {
     return false;
   }
+  set_decode_mode(DecodeMode::Running);
   return PrimeAndStart(threshold_frames, allow_empty);
 }
 
