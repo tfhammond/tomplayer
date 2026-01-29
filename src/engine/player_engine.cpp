@@ -168,7 +168,7 @@ void PlayerEngine::HandleCommand(const Command& command) {
   // Placeholder transitions for v1 skeleton. Actual logic is engine-owned only.
   if (std::holds_alternative<PlayCommand>(command)) {
     state_.store(PlayerState::Starting, std::memory_order_release);
-    set_decode_mode(DecodeMode::Running);
+    //set_decode_mode(DecodeMode::Running);
     const uint32_t threshold_frames =
         static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 5);
     if (StartPlaybackWithPriming(threshold_frames, false)) {
@@ -184,7 +184,7 @@ void PlayerEngine::HandleCommand(const Command& command) {
   }
   if (std::holds_alternative<ResumeCommand>(command)) {
     state_.store(PlayerState::Starting, std::memory_order_release);
-    set_decode_mode(DecodeMode::Running);
+    //set_decode_mode(DecodeMode::Running);
     const uint32_t threshold_frames =
         static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 20);
     if (StartPlaybackWithPriming(threshold_frames, true)) {
@@ -222,7 +222,7 @@ void PlayerEngine::HandleCommand(const Command& command) {
     if (desired_mode == DecodeMode::Paused) {
       CommitPaused();
     } else {
-      set_decode_mode(DecodeMode::Running);
+      //set_decode_mode(DecodeMode::Running);
       state_.store(PlayerState::Starting, std::memory_order_release);
       const uint32_t threshold_frames =
           static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 5);
@@ -240,7 +240,7 @@ void PlayerEngine::HandleCommand(const Command& command) {
     render_frame_offset_.store(0, std::memory_order_release);
     ResetBufferingState();
     BeginNewDecodeEpochAndSetTarget(0);
-    set_decode_mode(DecodeMode::Running);
+    //set_decode_mode(DecodeMode::Running);
     const uint32_t threshold_frames =
         static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 5);
     if (StartPlaybackWithPriming(threshold_frames, false)) {
@@ -452,7 +452,8 @@ bool PlayerEngine::EnsureOutputInitialized() {
   set_decode_mode(DecodeMode::Paused);
   WaitForDecodeIdle();
   DrainRingBuffer();
-  ring_buffer_ = std::make_unique<AudioRingBuffer>(device_rate * 2, device_channels);
+  ring_buffer_->reset();
+  //ring_buffer_ = std::make_unique<AudioRingBuffer>(device_rate * 2, device_channels);
   output_->set_ring_buffer(ring_buffer_.get());
   buffered_seconds_.store(0.0, std::memory_order_release);
   render_frame_offset_.store(0, std::memory_order_release);
