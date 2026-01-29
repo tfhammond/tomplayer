@@ -164,25 +164,25 @@ int RunWasapiDemo(int argc, char* argv[]) {
     PrintEngineStatus("startup", engine);
 
     engine.play();
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
     PrintEngineStatus("after play", engine);
 
     engine.seek_seconds(10.0);
     engine.seek_seconds(30.0);
     engine.seek_seconds(5.0);
-    std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
     PrintEngineStatus("after seeks", engine);
 
     engine.pause();
-    std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
     PrintEngineStatus("after pause", engine);
 
     engine.resume();
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
     PrintEngineStatus("after resume", engine);
 
     engine.stop();
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
     PrintEngineStatus("after stop", engine);
 
     engine.quit();
