@@ -512,15 +512,13 @@ void PlayerEngine::AdvancePriming(){
   if (!priming_active_ || !ring_buffer_ || !output_) {
     return ;
   }
-
   const uint32_t available = ring_buffer_->available_to_read_frames();
-  if (priming_allow_empty_){
-  }
-  else if (available < priming_target_frames_) {
+  if (!priming_allow_empty_ && available < priming_target_frames_) {
     return;
   }
 
   if (!output_->start()) {
+    set_decode_mode(DecodeMode::Paused);
     SetLastError("Failed to start WASAPI output.");
     state_.store(PlayerState::Error);
   } else {
