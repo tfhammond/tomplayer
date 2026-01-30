@@ -472,6 +472,8 @@ bool PlayerEngine::PrimeAndStart(uint32_t threshold_frames, bool allow_empty) {
   }
 
   const uint32_t target = threshold_frames;
+
+
   while (ring_buffer_->available_to_read_frames() < target) {
     if (allow_empty && ring_buffer_->available_to_read_frames() == 0) {
       break;
@@ -487,5 +489,21 @@ bool PlayerEngine::PrimeAndStart(uint32_t threshold_frames, bool allow_empty) {
 
   return true;
 }
+
+bool PlayerEngine::BeginPriming(uint32_t target, bool allow_empty) {
+  
+  if (!EnsureOutputInitialized()) {
+    state_.store(PlayerState::Error);
+    return false;
+  }
+
+  set_decode_mode(DecodeMode::Running);
+  priming_active_ = true;
+  priming_target_frames_ = target;
+  priming_allow_empty_ = allow_empty;
+  return true;
+}
+
+
 
 }  // namespace tomplayer::engine

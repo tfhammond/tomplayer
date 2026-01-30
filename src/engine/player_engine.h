@@ -166,6 +166,7 @@ private:
   void BeginNewDecodeEpochAndSetTarget(std::optional<int64_t> target_frame);
   void CommitPaused();
   bool StartPlaybackWithPriming(uint32_t threshold_frames, bool allow_empty);
+  bool BeginPriming(uint32_t target, bool allow_empty);
 
   // Decode control is owned by the engine thread; atomics provide snapshots to readers.
   // Epoch is a generation counter: any change that invalidates in-flight decode work
@@ -216,7 +217,7 @@ private:
 
   bool priming_active_ = false;
   uint32_t priming_target_frames_ = 0;
-  bool priming_allow_empty = false;
+  bool priming_allow_empty_ = false;
 };
 
 }  // namespace tomplayer::engine
