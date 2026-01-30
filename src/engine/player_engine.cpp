@@ -425,6 +425,11 @@ void PlayerEngine::SetDecodeIdle(bool idle) {
   }
 }
 
+void PlayerEngine::SetLastError(const char* message) {
+  std::lock_guard<std::mutex> lock(last_error_mutex_);
+  last_error_ = message ? message : "";
+}
+
 bool PlayerEngine::EnsureOutputInitialized() {
   if (output_initialized_) {
     return true;
@@ -433,16 +438,14 @@ bool PlayerEngine::EnsureOutputInitialized() {
     output_ = std::make_unique<tomplayer::wasapi::WasapiOutput>();
   }
   if (!output_->init_default_device()) {
-    std::lock_guard<std::mutex> lock(last_error_mutex_);
-    last_error_ = "Failed to initialize WASAPI output.";
+    SetLastError("Failed to initialize WASAPI output.");
     return false;
   }
 
   const uint32_t device_rate = output_->sample_rate();
   const uint32_t device_channels = output_->channels();
   if (device_rate == 0 || device_channels == 0) {
-    std::lock_guard<std::mutex> lock(last_error_mutex_);
-    last_error_ = "Invalid WASAPI mix format.";
+    SetLastError("Invalid WASAPI mix format.");
     return false;
   }
 
@@ -482,8 +485,7 @@ bool PlayerEngine::PrimeAndStart(uint32_t threshold_frames, bool allow_empty) {
   }
 
   if (!output_->start()) {
-    std::lock_guard<std::mutex> lock(last_error_mutex_);
-    last_error_ = "Failed to start WASAPI output.";
+    SetLastError("Failed to start WASAPI output.");
     return false;
   }
 
@@ -494,6 +496,7 @@ bool PlayerEngine::BeginPriming(uint32_t target, bool allow_empty) {
   
   if (!EnsureOutputInitialized()) {
     state_.store(PlayerState::Error);
+    priming_active_ = false;
     return false;
   }
 
@@ -502,6 +505,30 @@ bool PlayerEngine::BeginPriming(uint32_t target, bool allow_empty) {
   priming_target_frames_ = target;
   priming_allow_empty_ = allow_empty;
   return true;
+}
+
+void PlayerEngine::AdvancePriming(){
+  
+  if (!priming_active_ || !ring_buffer_ || !output_) {
+    return ;
+  }
+
+  const uint32_t available = ring_buffer_->available_to_read_frames();
+  if (priming_allow_empty_){
+  }
+  else if (available < priming_target_frames_) {
+    return;
+  }
+
+  if (!output_->start()) {
+    SetLastError("Failed to start WASAPI output.");
+    state_.store(PlayerState::Error);
+  } else {
+    state_.store(PlayerState::Playing);
+  }
+  priming_active_ = false;
+
+
 }
 
 

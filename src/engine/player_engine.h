@@ -157,6 +157,7 @@ private:
   void WaitForDecodeIdle();
   void DrainRingBuffer();
   void SetDecodeIdle(bool idle);
+  void SetLastError(const char* message);
   bool EnsureOutputInitialized();
   bool PrimeAndStart(uint32_t threshold_frames, bool allow_empty);
   void StopOutputAndResetRenderedFrames();
@@ -167,6 +168,7 @@ private:
   void CommitPaused();
   bool StartPlaybackWithPriming(uint32_t threshold_frames, bool allow_empty);
   bool BeginPriming(uint32_t target, bool allow_empty);
+  void AdvancePriming();
 
   // Decode control is owned by the engine thread; atomics provide snapshots to readers.
   // Epoch is a generation counter: any change that invalidates in-flight decode work
