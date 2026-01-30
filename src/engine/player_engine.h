@@ -213,6 +213,10 @@ private:
 
   std::thread engine_thread_;
   std::thread decode_thread_;
+
+  bool priming_active_ = false;
+  uint32_t priming_target_frames_ = 0;
+  bool priming_allow_empty = false;
 };
 
 }  // namespace tomplayer::engine
