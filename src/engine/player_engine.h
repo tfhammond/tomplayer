@@ -159,14 +159,12 @@ private:
   void SetDecodeIdle(bool idle);
   void SetLastError(const char* message);
   bool EnsureOutputInitialized();
-  bool PrimeAndStart(uint32_t threshold_frames, bool allow_empty);
   void StopOutputAndResetRenderedFrames();
   void PauseDecodeAndWaitIdle();
   void StopDecodeAndWaitIdle();
   void ResetBufferingState();
   void BeginNewDecodeEpochAndSetTarget(std::optional<int64_t> target_frame);
   void CommitPaused();
-  bool StartPlaybackWithPriming(uint32_t threshold_frames, bool allow_empty);
   bool BeginPriming(uint32_t target, bool allow_empty);
   void AdvancePriming();
 

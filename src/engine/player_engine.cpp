@@ -172,7 +172,6 @@ void PlayerEngine::HandleCommand(const Command& command) {
   // Placeholder transitions for v1 skeleton. Actual logic is engine-owned only.
   if (std::holds_alternative<PlayCommand>(command)) {
     state_.store(PlayerState::Starting, std::memory_order_release);
-    //set_decode_mode(DecodeMode::Running);
     const uint32_t threshold_frames =
         static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 5);
     if (!BeginPriming(threshold_frames, false)) {
@@ -187,11 +186,10 @@ void PlayerEngine::HandleCommand(const Command& command) {
   }
   if (std::holds_alternative<ResumeCommand>(command)) {
     state_.store(PlayerState::Starting, std::memory_order_release);
-    //set_decode_mode(DecodeMode::Running);
     const uint32_t threshold_frames =
         static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 20);
     if (!BeginPriming(threshold_frames, true)) {
-      return; //leaving this cuz maybe ill need it later IDK LOL
+      return;
     } 
     return;
   }
@@ -225,7 +223,6 @@ void PlayerEngine::HandleCommand(const Command& command) {
     if (desired_mode == DecodeMode::Paused) {
       CommitPaused();
     } else {
-      //set_decode_mode(DecodeMode::Running);
       state_.store(PlayerState::Starting, std::memory_order_release);
       const uint32_t threshold_frames =
           static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 5);
@@ -241,7 +238,6 @@ void PlayerEngine::HandleCommand(const Command& command) {
     render_frame_offset_.store(0, std::memory_order_release);
     ResetBufferingState();
     BeginNewDecodeEpochAndSetTarget(0);
-    //set_decode_mode(DecodeMode::Running);
     priming_active_ = false;
     const uint32_t threshold_frames =
         static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 5);
@@ -303,14 +299,6 @@ void PlayerEngine::CommitPaused() {
   }
   state_.store(PlayerState::Paused, std::memory_order_release);
   set_decode_mode(DecodeMode::Paused);
-}
-
-bool PlayerEngine::StartPlaybackWithPriming(uint32_t threshold_frames, bool allow_empty) {
-  if (!EnsureOutputInitialized()) {
-    return false;
-  }
-  set_decode_mode(DecodeMode::Running);
-  return PrimeAndStart(threshold_frames, allow_empty);
 }
 
 void PlayerEngine::DecodeLoop() {
@@ -463,32 +451,6 @@ bool PlayerEngine::EnsureOutputInitialized() {
   output_->reset_rendered_frames();
 
   output_initialized_ = true;
-  return true;
-}
-
-bool PlayerEngine::PrimeAndStart(uint32_t threshold_frames, bool allow_empty) {
-  if (!output_) {
-    return false;
-  }
-  if (!ring_buffer_) {
-    return false;
-  }
-
-  const uint32_t target = threshold_frames;
-
-
-  while (ring_buffer_->available_to_read_frames() < target) {
-    if (allow_empty && ring_buffer_->available_to_read_frames() == 0) {
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-
-  if (!output_->start()) {
-    SetLastError("Failed to start WASAPI output.");
-    return false;
-  }
-
   return true;
 }
 
