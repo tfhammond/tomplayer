@@ -146,6 +146,47 @@ void PrintEngineStatus(const char* label,
   }
   std::cout << "\n";
 }
+
+bool WaitForStateOrError(const tomplayer::engine::PlayerEngine& engine,
+                         tomplayer::engine::PlayerEngine::PlayerState desired,
+                         std::chrono::milliseconds timeout,
+                         const char* label) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    const auto status = engine.get_status();
+    if (status.state == desired) {
+      return true;
+    }
+    if (status.state == tomplayer::engine::PlayerEngine::PlayerState::Error) {
+      std::cerr << "Engine smoke failed waiting for " << label
+                << ": " << status.last_error << "\n";
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  std::cerr << "Engine smoke timeout waiting for " << label << ".\n";
+  return false;
+}
+
+bool WaitForSeekApplied(const tomplayer::engine::PlayerEngine& engine,
+                        uint64_t starting_epoch,
+                        std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    const auto status = engine.get_status();
+    if (status.state == tomplayer::engine::PlayerEngine::PlayerState::Error) {
+      std::cerr << "Engine smoke failed waiting for seek: " << status.last_error
+                << "\n";
+      return false;
+    }
+    if (status.decode_epoch > starting_epoch) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  std::cerr << "Engine smoke timeout waiting for seek apply.\n";
+  return false;
+}
 }  // namespace
 
 int RunWasapiDemo(int argc, char* argv[]) {
@@ -164,25 +205,56 @@ int RunWasapiDemo(int argc, char* argv[]) {
     PrintEngineStatus("startup", engine);
 
     engine.play();
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    if (!WaitForStateOrError(
+            engine, tomplayer::engine::PlayerEngine::PlayerState::Playing,
+            std::chrono::milliseconds(500), "Playing")) {
+      engine.quit();
+      return 1;
+    }
     PrintEngineStatus("after play", engine);
 
+    const auto before_seek = engine.get_status().decode_epoch;
     engine.seek_seconds(10.0);
     engine.seek_seconds(30.0);
     engine.seek_seconds(5.0);
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    if (!WaitForSeekApplied(engine, before_seek,
+                            std::chrono::milliseconds(500))) {
+      engine.quit();
+      return 1;
+    }
+    if (!WaitForStateOrError(
+            engine, tomplayer::engine::PlayerEngine::PlayerState::Playing,
+            std::chrono::milliseconds(500), "Playing after seeks")) {
+      engine.quit();
+      return 1;
+    }
     PrintEngineStatus("after seeks", engine);
 
     engine.pause();
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    if (!WaitForStateOrError(
+            engine, tomplayer::engine::PlayerEngine::PlayerState::Paused,
+            std::chrono::milliseconds(500), "Paused")) {
+      engine.quit();
+      return 1;
+    }
     PrintEngineStatus("after pause", engine);
 
     engine.resume();
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    if (!WaitForStateOrError(
+            engine, tomplayer::engine::PlayerEngine::PlayerState::Playing,
+            std::chrono::milliseconds(500), "Playing after resume")) {
+      engine.quit();
+      return 1;
+    }
     PrintEngineStatus("after resume", engine);
 
     engine.stop();
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!WaitForStateOrError(
+            engine, tomplayer::engine::PlayerEngine::PlayerState::Stopped,
+            std::chrono::milliseconds(500), "Stopped")) {
+      engine.quit();
+      return 1;
+    }
     PrintEngineStatus("after stop", engine);
 
     engine.quit();
