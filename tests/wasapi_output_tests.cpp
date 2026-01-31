@@ -45,6 +45,37 @@ struct FakeStartStopApi {
   }
 };
 
+struct FakeFormatSupportApi {
+  bool called = false;
+  AUDCLNT_SHAREMODE last_share_mode = AUDCLNT_SHAREMODE_SHARED;
+  HRESULT result = S_OK;
+  WAVEFORMATEXTENSIBLE captured{};
+  WAVEFORMATEX* closest = nullptr;
+
+  static HRESULT IsFormatSupportedThunk(void* ctx,
+                                        AUDCLNT_SHAREMODE share_mode,
+                                        const WAVEFORMATEX* format,
+                                        WAVEFORMATEX** closest_out) {
+    auto* self = static_cast<FakeFormatSupportApi*>(ctx);
+    self->called = true;
+    self->last_share_mode = share_mode;
+    if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+      self->captured = *reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(format);
+    } else {
+      self->captured = {};
+      self->captured.Format = *format;
+    }
+    if (closest_out) {
+      *closest_out = self->closest;
+    }
+    return self->result;
+  }
+
+  tomplayer::wasapi::detail::FormatSupportApi api() {
+    return {this, &IsFormatSupportedThunk};
+  }
+};
+
 struct WinHandle {
   HANDLE handle = nullptr;
   explicit WinHandle(HANDLE value) : handle(value) {}
@@ -108,19 +139,26 @@ TEST_CASE("DetectSampleFormat handles all mix format branches") {
   }
 }
 
-// Verifies clamp/scaling rules for float-to-PCM16 conversion used on the render path.
-TEST_CASE("ConvertFloatToPcm16 clamps and scales") {
-  std::array<float, 6> input = {1.0f, -1.0f, 0.5f, -0.5f, 1.5f, -1.5f};
-  std::array<int16_t, 6> output{};
+// Ensures init_default_device enforces a float32 format request.
+TEST_CASE("SelectFloat32MixFormat requests float32 with device rate/channels") {
+  FakeFormatSupportApi fake;
+  WAVEFORMATEX mix{};
+  mix.wFormatTag = WAVE_FORMAT_PCM;
+  mix.nChannels = 2;
+  mix.nSamplesPerSec = 48000;
+  mix.wBitsPerSample = 16;
+  mix.nBlockAlign = static_cast<WORD>(mix.nChannels * (mix.wBitsPerSample / 8));
+  mix.nAvgBytesPerSec = mix.nSamplesPerSec * mix.nBlockAlign;
 
-  tomplayer::wasapi::detail::ConvertFloatToPcm16(input.data(), output.data(), output.size());
-
-  REQUIRE(output[0] == 32767);
-  REQUIRE(output[1] == -32767);
-  REQUIRE(output[2] == 16383);
-  REQUIRE(output[3] == -16383);
-  REQUIRE(output[4] == 32767);
-  REQUIRE(output[5] == -32767);
+  WAVEFORMATEXTENSIBLE out{};
+  REQUIRE(tomplayer::wasapi::detail::SelectFloat32MixFormat(fake.api(), &mix, &out));
+  REQUIRE(fake.called);
+  REQUIRE(fake.last_share_mode == AUDCLNT_SHAREMODE_SHARED);
+  REQUIRE(fake.captured.Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE);
+  REQUIRE(fake.captured.Format.nSamplesPerSec == mix.nSamplesPerSec);
+  REQUIRE(fake.captured.Format.nChannels == mix.nChannels);
+  REQUIRE(fake.captured.Format.wBitsPerSample == 32);
+  REQUIRE(IsEqualGUID(fake.captured.SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT));
 }
 
 // Validates ring-buffer consumption zero-fills missing frames on underrun.
@@ -153,43 +191,6 @@ TEST_CASE("ConsumeRingBufferFloat zero-fills tail on underrun") {
   REQUIRE(output[7] == 0.0f);
   REQUIRE(underrun_wakes.load() == 1);
   REQUIRE(underrun_frames.load() == 2);
-}
-
-// Confirms PCM16 path converts zero-filled tail to zeros in endpoint buffer.
-TEST_CASE("ConsumeRingBufferFloat underrun yields zero PCM16 tail") {
-  const uint32_t channels = 2;
-  AudioRingBuffer buffer(4, channels);
-  std::array<float, 4> input = {1.0f, -1.0f, 0.5f, -0.5f};
-  std::array<float, 8> scratch{};
-  std::array<int16_t, 8> output{};
-  std::atomic<uint64_t> underrun_wakes{0};
-  std::atomic<uint64_t> underrun_frames{0};
-
-  REQUIRE(buffer.write_frames(input.data(), 2) == 2);
-
-  const uint32_t frames_read = tomplayer::wasapi::detail::ConsumeRingBufferFloat(
-      &buffer,
-      scratch.data(),
-      4,
-      channels,
-      &underrun_wakes,
-      &underrun_frames);
-
-  REQUIRE(frames_read == 2);
-
-  tomplayer::wasapi::detail::ConvertFloatToPcm16(
-      scratch.data(),
-      output.data(),
-      output.size());
-
-  REQUIRE(output[0] == 32767);
-  REQUIRE(output[1] == -32767);
-  REQUIRE(output[2] == 16383);
-  REQUIRE(output[3] == -16383);
-  REQUIRE(output[4] == 0);
-  REQUIRE(output[5] == 0);
-  REQUIRE(output[6] == 0);
-  REQUIRE(output[7] == 0);
 }
 
 // Covers lifecycle paths that can be validated without COM or real devices.

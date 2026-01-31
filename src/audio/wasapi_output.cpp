@@ -39,18 +39,6 @@ SampleFormat DetectSampleFormat(const WAVEFORMATEX* format) {
   return SampleFormat::Unsupported;
 }
 
-void ConvertFloatToPcm16(const float* in, int16_t* out, std::size_t samples) {
-  for (std::size_t i = 0; i < samples; ++i) {
-    float sample = in[i];
-    if (sample > 1.0f) {
-      sample = 1.0f;
-    } else if (sample < -1.0f) {
-      sample = -1.0f;
-    }
-    out[i] = static_cast<int16_t>(sample * 32767.0f);
-  }
-}
-
 uint32_t ConsumeRingBufferFloat(AudioRingBuffer* ring_buffer,
                                 float* dst_interleaved,
                                 uint32_t frames_requested,
@@ -84,6 +72,52 @@ uint32_t ConsumeRingBufferFloat(AudioRingBuffer* ring_buffer,
   }
 
   return frames_read;
+}
+
+bool SelectFloat32MixFormat(const FormatSupportApi& api,
+                            const WAVEFORMATEX* device_mix_format,
+                            WAVEFORMATEXTENSIBLE* float32_format) {
+  if (!api.IsFormatSupported || !device_mix_format || !float32_format) {
+    return false;
+  }
+  if (device_mix_format->nSamplesPerSec == 0 || device_mix_format->nChannels == 0) {
+    return false;
+  }
+
+  WAVEFORMATEXTENSIBLE requested{};
+  requested.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+  requested.Format.nChannels = device_mix_format->nChannels;
+  requested.Format.nSamplesPerSec = device_mix_format->nSamplesPerSec;
+  requested.Format.wBitsPerSample = 32;
+  requested.Format.nBlockAlign =
+      static_cast<WORD>(requested.Format.nChannels * sizeof(float));
+  requested.Format.nAvgBytesPerSec =
+      requested.Format.nSamplesPerSec * requested.Format.nBlockAlign;
+  requested.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+  requested.Samples.wValidBitsPerSample = 32;
+  requested.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+
+  if (device_mix_format->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+    const auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(device_mix_format);
+    requested.dwChannelMask = ext->dwChannelMask;
+  } else {
+    requested.dwChannelMask = 0;
+  }
+
+  WAVEFORMATEX* closest = nullptr;
+  const HRESULT hr = api.IsFormatSupported(api.context,
+                                           AUDCLNT_SHAREMODE_SHARED,
+                                           &requested.Format,
+                                           &closest);
+  if (closest) {
+    CoTaskMemFree(closest);
+  }
+  if (hr != S_OK) {
+    return false;
+  }
+
+  *float32_format = requested;
+  return true;
 }
 
 }  // namespace detail
@@ -140,21 +174,31 @@ bool WasapiOutput::init_default_device() {
     return false;
   }
 
+  format_support_api_.context = audio_client_.Get();
+  format_support_api_.IsFormatSupported =
+      [](void* context,
+         AUDCLNT_SHAREMODE share_mode,
+         const WAVEFORMATEX* format,
+         WAVEFORMATEX** closest) -> HRESULT {
+        return static_cast<IAudioClient*>(context)->IsFormatSupported(share_mode,
+                                                                      format,
+                                                                      closest);
+      };
 
-  sample_format_ = detail::DetectSampleFormat(mix_format_);
-  if (sample_format_ == SampleFormat::Unsupported) {
+  WAVEFORMATEXTENSIBLE float32_format{};
+  if (!detail::SelectFloat32MixFormat(format_support_api_, mix_format_, &float32_format)) {
     shutdown();
     return false;
   }
-  sample_rate_ = mix_format_->nSamplesPerSec;
-  channels_ = mix_format_->nChannels;
-  bits_per_sample_ = mix_format_->wBitsPerSample;
-  block_align_ = mix_format_->nBlockAlign;
-  
+  sample_rate_ = float32_format.Format.nSamplesPerSec;
+  channels_ = float32_format.Format.nChannels;
+  bits_per_sample_ = float32_format.Format.wBitsPerSample;
+  block_align_ = float32_format.Format.nBlockAlign;
+  sample_format_ = SampleFormat::Float32;
 
   hr = audio_client_->Initialize(AUDCLNT_SHAREMODE_SHARED,
                                  AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                 0, 0, mix_format_, nullptr);
+                                 0, 0, &float32_format.Format, nullptr);
   if (FAILED(hr)) {
     shutdown();
     return false;
@@ -184,12 +228,6 @@ bool WasapiOutput::init_default_device() {
   if (FAILED(hr)) {
     shutdown();
     return false;
-  }
-
-  if (sample_format_ == SampleFormat::Pcm16) {
-    // Allocate conversion scratch up-front to keep the render path allocation-free.
-    const size_t samples = static_cast<size_t>(buffer_frames_) * channels_;
-    float_scratch_ = std::make_unique<float[]>(samples);
   }
 
   render_api_context_.audio_client = audio_client_.Get();
@@ -297,9 +335,9 @@ void WasapiOutput::shutdown() {
   audio_client_.Reset();
   device_.Reset();
 
-  float_scratch_.reset();
   render_api_ = {};
   start_stop_api_ = {};
+  format_support_api_ = {};
   render_api_context_ = {};
 
   buffer_frames_ = 0;
@@ -372,38 +410,24 @@ void WasapiOutput::RenderAudio() {
     return;
   }
 
-  if (sample_format_ == SampleFormat::Float32) {
-    float* out = reinterpret_cast<float*>(data);
-    const uint32_t frames_read = detail::ConsumeRingBufferFloat(ring_buffer_,
-                                                                out,
-                                                                frames_available,
-                                                                channels_,
-                                                                &underrun_wake_count_,
-                                                                &underrun_frame_count_);
-
-    const DWORD flags = frames_read == 0 ? AUDCLNT_BUFFERFLAGS_SILENT : 0;
-    render_api_.ReleaseBuffer(render_api_.context, frames_available, flags);
+  // if not float32 then play silence (avoids garbage noise)
+  if (sample_format_ != SampleFormat::Float32) {
+    render_api_.ReleaseBuffer(render_api_.context, frames_available, AUDCLNT_BUFFERFLAGS_SILENT);
     return;
   }
 
-  if (sample_format_ == SampleFormat::Pcm16 && float_scratch_) {
-    const uint32_t frames_read = detail::ConsumeRingBufferFloat(ring_buffer_,
-                                                                float_scratch_.get(),
-                                                                frames_available,
-                                                                channels_,
-                                                                &underrun_wake_count_,
-                                                                &underrun_frame_count_);
-    const std::size_t samples =
-        static_cast<std::size_t>(frames_available) * channels_;
-    detail::ConvertFloatToPcm16(float_scratch_.get(),
-                                reinterpret_cast<int16_t*>(data),
-                                samples);
-    const DWORD flags = frames_read == 0 ? AUDCLNT_BUFFERFLAGS_SILENT : 0;
-    render_api_.ReleaseBuffer(render_api_.context, frames_available, flags);
-    return;
-  }
+  float* out = reinterpret_cast<float*>(data);
+  const uint32_t frames_read = detail::ConsumeRingBufferFloat(ring_buffer_,
+                                                              out,
+                                                              frames_available,
+                                                              channels_,
+                                                              &underrun_wake_count_,
+                                                              &underrun_frame_count_);
 
-  render_api_.ReleaseBuffer(render_api_.context, frames_available, AUDCLNT_BUFFERFLAGS_SILENT);
+  const DWORD flags = frames_read == 0 ? AUDCLNT_BUFFERFLAGS_SILENT : 0;
+  render_api_.ReleaseBuffer(render_api_.context, frames_available, flags);
+  // Count all frames handed to WASAPI, including silence, to track playback clock.
+  rendered_frames_total_.fetch_add(frames_available, std::memory_order_relaxed);
 }
 
 #if defined(TOMPLAYER_TESTING)

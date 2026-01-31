@@ -36,6 +36,24 @@ public:
   // Errors: none.
   uint32_t available_to_read_frames() const;
 
+  // Summary: Capacity in frames.
+  // Preconditions: none.
+  // Postconditions: does not modify state.
+  // Errors: none.
+  uint32_t capacity_frames() const { return capacity_frames_; }
+
+  // Summary: Frames available to read (alias of available_to_read_frames).
+  // Preconditions: none.
+  // Postconditions: does not modify state.
+  // Errors: none.
+  uint32_t readable_frames() const { return available_to_read_frames(); }
+
+  // Summary: Frames available to write (alias of available_to_write_frames).
+  // Preconditions: none.
+  // Postconditions: does not modify state.
+  // Errors: none.
+  uint32_t writable_frames() const { return available_to_write_frames(); }
+
   // Summary: Read up to frames_requested into interleaved destination.
   // Preconditions: dst_interleaved points to frames_requested * channels samples.
   // Postconditions: advances read position by frames_read.
