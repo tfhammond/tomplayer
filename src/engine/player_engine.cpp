@@ -138,6 +138,7 @@ void PlayerEngine::EngineLoop() {
 
     if (has_command) {
       if (std::holds_alternative<QuitCommand>(command)) {
+        priming_active_ = false;
         set_decode_mode(DecodeMode::Quit);
         bump_epoch();
         if (output_) {
@@ -157,6 +158,9 @@ void PlayerEngine::EngineLoop() {
                   static_cast<double>(sample_rate)
             : 0.0;
     buffered_seconds_.store(buffered_seconds, std::memory_order_release);
+
+    AdvancePriming();
+
   }
 
   if (com_should_uninit) {
@@ -171,14 +175,13 @@ void PlayerEngine::HandleCommand(const Command& command) {
     //set_decode_mode(DecodeMode::Running);
     const uint32_t threshold_frames =
         static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 5);
-    if (StartPlaybackWithPriming(threshold_frames, false)) {
-      state_.store(PlayerState::Playing, std::memory_order_release);
-    } else {
-      state_.store(PlayerState::Error, std::memory_order_release);
+    if (!BeginPriming(threshold_frames, false)) {
+      return;
     }
     return;
   }
   if (std::holds_alternative<PauseCommand>(command)) {
+    priming_active_ = false;
     CommitPaused();
     return;
   }
@@ -187,14 +190,13 @@ void PlayerEngine::HandleCommand(const Command& command) {
     //set_decode_mode(DecodeMode::Running);
     const uint32_t threshold_frames =
         static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 20);
-    if (StartPlaybackWithPriming(threshold_frames, true)) {
-      state_.store(PlayerState::Playing, std::memory_order_release);
-    } else {
-      state_.store(PlayerState::Error, std::memory_order_release);
-    }
+    if (!BeginPriming(threshold_frames, true)) {
+      return; //leaving this cuz maybe ill need it later IDK LOL
+    } 
     return;
   }
   if (std::holds_alternative<StopCommand>(command)) {
+    priming_active_ = false;
     StopOutputAndResetRenderedFrames();
     state_.store(PlayerState::Stopped, std::memory_order_release);
     render_frame_offset_.store(0, std::memory_order_release);
@@ -219,6 +221,7 @@ void PlayerEngine::HandleCommand(const Command& command) {
     PauseDecodeAndWaitIdle();
     ResetBufferingState();
     BeginNewDecodeEpochAndSetTarget(frames);
+    priming_active_ = false;
     if (desired_mode == DecodeMode::Paused) {
       CommitPaused();
     } else {
@@ -226,10 +229,8 @@ void PlayerEngine::HandleCommand(const Command& command) {
       state_.store(PlayerState::Starting, std::memory_order_release);
       const uint32_t threshold_frames =
           static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 5);
-      if (StartPlaybackWithPriming(threshold_frames, false)) {
-        state_.store(PlayerState::Playing, std::memory_order_release);
-      } else {
-        state_.store(PlayerState::Error, std::memory_order_release);
+      if (!BeginPriming(threshold_frames, false)) {
+        return;
       }
     }
     return;
@@ -241,12 +242,11 @@ void PlayerEngine::HandleCommand(const Command& command) {
     ResetBufferingState();
     BeginNewDecodeEpochAndSetTarget(0);
     //set_decode_mode(DecodeMode::Running);
+    priming_active_ = false;
     const uint32_t threshold_frames =
         static_cast<uint32_t>(sample_rate_hz_.load(std::memory_order_acquire) / 5);
-    if (StartPlaybackWithPriming(threshold_frames, false)) {
-      state_.store(PlayerState::Playing, std::memory_order_release);
-    } else {
-      state_.store(PlayerState::Error, std::memory_order_release);
+    if (!BeginPriming(threshold_frames, false)) {
+      return;
     }
     return;
   }
