@@ -432,6 +432,13 @@ bool PlayerEngine::EnsureOutputInitialized() {
 
   const uint32_t device_rate = output_->sample_rate();
   const uint32_t device_channels = output_->channels();
+
+  // Stereo only for right now.
+  if (device_channels != 2) {
+    SetLastError("Only stereo WASAPI output is supported.");
+    return false;
+  }
+
   if (device_rate == 0 || device_channels == 0) {
     SetLastError("Invalid WASAPI mix format.");
     return false;
